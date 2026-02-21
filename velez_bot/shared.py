@@ -21,6 +21,14 @@ import argparse
 import os
 from typing import List, Optional, cast
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG_DIR = os.path.join(PROJECT_ROOT, "log_file")
+
+
+def ensure_log_dir() -> str:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    return LOG_DIR
+
 # ======================================================================
 # --- 🌍 全局环境初始化 ---
 # ======================================================================
@@ -160,7 +168,7 @@ def sys_log(msg, level="System"):
     try:
         # 文件名锁定：Global_System_YYYYMMDD.log
         today_str = now.strftime('%Y%m%d')
-        file_name = f"Global_System_{today_str}.log"
+        file_name = os.path.join(ensure_log_dir(), f"Global_System_{today_str}.log")
         
         # 使用追加模式 ('a') 确保重启不覆盖旧日志
         with open(file_name, "a", encoding="utf-8") as f:

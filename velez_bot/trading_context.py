@@ -145,7 +145,7 @@ class TradingContext:
 
         # 日志配置
         today_str = datetime.now(EASTERN_TZ).strftime('%Y-%m-%d')
-        self.log_filename = f"log_{self.symbol}_{today_str}.txt"
+        self.log_filename = os.path.join(ensure_log_dir(), f"log_{self.symbol}_{today_str}.txt")
         self.sys_log(f"✅{symbol}的变量初始化工作完成", level="INFO")
 
     def sys_log(self, message, level="INFO"):
@@ -401,7 +401,7 @@ class TradingContext:
 
             # --- 6. 物理增量落盘 (CSV) ---
             today_str = datetime.now(EASTERN_TZ).strftime('%Y%m%d')
-            file_name = f"{self.symbol}_Trade_Activity_{today_str}.csv"
+            file_name = os.path.join(ensure_log_dir(), f"{self.symbol}_Trade_Activity_{today_str}.csv")
             
             df_item = pd.DataFrame([record])
             file_exists = os.path.isfile(file_name)
@@ -426,10 +426,8 @@ class TradingContext:
                 f"Pos: {self.actual_filled_qty} | State: {self.state}\n"
             )
             
-            # 文件路径：例如 logs/AAPL_2026-02-08.audit
-            log_dir = "logs"
-            if not os.path.exists(log_dir): os.makedirs(log_dir)
-            file_path = os.path.join(log_dir, f"{self.symbol}_{datetime.now().strftime('%Y-%m-%d')}.audit")
+            # 文件路径：例如 log_file/AAPL_2026-02-08.audit
+            file_path = os.path.join(ensure_log_dir(), f"{self.symbol}_{datetime.now().strftime('%Y-%m-%d')}.audit")
             
             with open(file_path, "a", encoding="utf-8") as f:
                 f.write(log_line)
@@ -525,7 +523,7 @@ class TradingContext:
             
             # --- 6. 物理落地 CSV ---
             safe_time_str = end_time_str.replace(":", "-")
-            K_LINE_FILE = f'{self.symbol}-2min-Kline-{safe_time_str}.csv'
+            K_LINE_FILE = os.path.join(ensure_log_dir(), f'{self.symbol}-2min-Kline-{safe_time_str}.csv')
             try:
                 raw_df.to_csv(K_LINE_FILE, index=False)
             except Exception as e:
@@ -625,11 +623,17 @@ class TradingContext:
         
         # 1. 导出大象柱复盘报告
         if self.elephant_bar_log:
-            pd.DataFrame(self.elephant_bar_log).to_csv(f"{self.symbol}-Elephant-{timestamp}.csv", index=False)
+            pd.DataFrame(self.elephant_bar_log).to_csv(
+                os.path.join(ensure_log_dir(), f"{self.symbol}-Elephant-{timestamp}.csv"),
+                index=False
+            )
             
         # 2. 导出全天原始 K 线 (用于后期回测校验)
         if not self.history_2min_bars.empty:
-            self.history_2min_bars.to_csv(f"{self.symbol}-FullDay-Kline-{timestamp}.csv", index=False)
+            self.history_2min_bars.to_csv(
+                os.path.join(ensure_log_dir(), f"{self.symbol}-FullDay-Kline-{timestamp}.csv"),
+                index=False
+            )
             
         self.sys_log("💾 复盘数据包（大象柱/K线）归档成功。")
 

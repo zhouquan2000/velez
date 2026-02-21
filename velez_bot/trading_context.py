@@ -401,7 +401,7 @@ class TradingContext:
 
             # --- 6. 物理增量落盘 (CSV) ---
             today_str = datetime.now(EASTERN_TZ).strftime('%Y%m%d')
-            file_name = os.path.join(ensure_log_dir(), f"{self.symbol}_Trade_Activity_{today_str}.csv")
+            file_name = os.path.join(shared.ensure_log_dir(), f"{self.symbol}_Trade_Activity_{today_str}.csv")
             
             df_item = pd.DataFrame([record])
             file_exists = os.path.isfile(file_name)
@@ -523,7 +523,7 @@ class TradingContext:
             
             # --- 6. 物理落地 CSV ---
             safe_time_str = end_time_str.replace(":", "-")
-            K_LINE_FILE = os.path.join(ensure_log_dir(), f'{self.symbol}-2min-Kline-{safe_time_str}.csv')
+            K_LINE_FILE = os.path.join(shared.ensure_log_dir(), f'{self.symbol}-2min-Kline-{safe_time_str}.csv')
             try:
                 raw_df.to_csv(K_LINE_FILE, index=False)
             except Exception as e:
@@ -631,7 +631,7 @@ class TradingContext:
         # 2. 导出全天原始 K 线 (用于后期回测校验)
         if not self.history_2min_bars.empty:
             self.history_2min_bars.to_csv(
-                os.path.join(ensure_log_dir(), f"{self.symbol}-FullDay-Kline-{timestamp}.csv"),
+                os.path.join(shared.ensure_log_dir(), f"{self.symbol}-FullDay-Kline-{timestamp}.csv"),
                 index=False
             )
             

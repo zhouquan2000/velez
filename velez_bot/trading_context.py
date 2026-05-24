@@ -62,12 +62,15 @@ class TradingContext:
         self.contract = Stock(symbol, "SMART", "USD")
         self.loop = loop
         # --- 1. [风险与执行参数] ---
-        self.risk_unit = float(kwargs.get("risk_unit", 120))  # 默认$120
+        self.risk_unit = float(kwargs.pop("risk_unit", 120))  # 默认$120
         self.max_qty = int(kwargs.pop("max_qty", 200))  # 默认200股
         self.eb_range_mult = float(kwargs.pop("eb_range_mult", 2.0))
         self.eb_vol_mult = float(kwargs.pop("eb_vol_mult", 1.2))
-        self.eb_body_ratio = float(kwargs.pop("eb_body_ratio", 0.85))
-
+        self.eb_body_ratio = float(kwargs.pop("eb_body_ratio", 0.70))
+        self.stop_min_gap = float(kwargs.pop("stop_min_gap", 0.25))
+        self.eb_body_quantile = float(kwargs.pop("eb_body_quantile", 0.80))
+        self.eb_range_quantile = float(kwargs.pop("eb_range_quantile", 0.80))
+        self.eb_body_max_ratio = float(kwargs.pop("eb_body_max_ratio", 0.90))
         self.static_atr = float(kwargs.pop("static_atr", 0.5))  # 初始静态ATR
         self.atr = self.static_atr  # 动态ATR缓存
         self.effective_atr = 0.0  # 用于 plan_trade 的动态 ATR 锚点
@@ -78,7 +81,6 @@ class TradingContext:
         self.custom_params = kwargs  # 用于扩展参数
         self.pnl_total = 0.0
         self.filled_flag = False
-        self.chase_flag = False  # 追单标志
         # --- [各个law信号满足时候的变量] 用于固化探测瞬间的价格锚点 ---
         self.law1_sl = None
         self.law1_trigger_high = None
@@ -129,6 +131,14 @@ class TradingContext:
         self.law1_soft_clear = False
         self.law1_hard_clear = False
         self.law1_context = None
+        self.law1_pending = None
+        self.law1_pending_bar_index = None
+        self.law1_pending_side = None
+        self.law1_pending_high = None
+        self.law1_pending_low = None
+        self.law1_pending_context = None
+        self.law1_pending_score = None
+        self.law1_pending_hard_clear = None
 
         # 🔥🔥🔥【新增】orderRef 解析结果缓存（供 sync_position 使用）
         self.order_features = (
@@ -161,9 +171,10 @@ class TradingContext:
 
         self.dip_of_2min = 0.0
         self.bounce_of_2min = 0.0
-        self.low_of_4min = 0.0
-        self.high_of_4min = 0.0
-
+        self.low_of_6min = 0.0
+        self.high_of_6min = 0.0
+        self.ma20_series_cache = None  # 新增
+        self.ma8_series_cache = None  # 新增
         # --- 3.1 [状态机与影子账本] ---
         self.last_processed_time = (
             None  # 初始化为 None，确保第一次计算能顺利通过哨兵校验
@@ -186,7 +197,7 @@ class TradingContext:
         self.last_cond = "Cond_01_IDLE"
         self._temp_order_audit = {
             "order_id": 0,  # 捕获 p_order.orderId
-            "label": "IDLE",  # 捕获指令中的 label
+            "label": "Unknow",  # 捕获指令中的 label
             "trigger_price": 0.0,  # 触发时的参考价 (财务对账基准)
             "last_p_lmt": 0.0,  # 下单瞬间的主订单的 LMT 价
             "last_s_aux": 0.0,  # 下单瞬间的止损单的 Stop 价格（用于固定 Gap）
@@ -221,6 +232,10 @@ class TradingContext:
         self.currrent_tp_cond = ""
         self.last_stop_cond = "IDLE"
         self.last_tp_cond = "IDLE"
+
+        self.tp1_trail_anchor = None
+        self.tp1_trail_side = None
+        self.tp1_trail_cost = None
 
         # --- 3.3 [财务审计与对账开关] ---
         self.entry_total_count = 0  # 累计成交笔数
@@ -272,11 +287,45 @@ class TradingContext:
 
         # 日志配置
         today_str = datetime.now(EASTERN_TZ).strftime("%Y-%m-%d")
+        # 5s bar CSV 持久化配置---保存5s bar数据文件定义
+        self.raw_5s_csv_filename = os.path.join(
+            ensure_log_dir(), f"{self.symbol}-5s-{today_str}.csv"
+        )
+        self.last_5s_saved_dt = None  # 增量写入指针（避免重复写）
+        self.raw_5s_csv_header_written = (
+            os.path.exists(self.raw_5s_csv_filename)
+            and os.path.getsize(self.raw_5s_csv_filename) > 0
+        )
+        # 2m bar CSV 持久化配置---保存2mins K线数据文件定义
+        self.raw_2m_csv_filename = os.path.join(
+            ensure_log_dir(), f"{self.symbol}-2m-{today_str}.csv"
+        )
+        self.last_2m_saved_dt = None  # 增量写入指针（避免重复写）
+        self.raw_2m_csv_header_written = (
+            os.path.exists(self.raw_2m_csv_filename)
+            and os.path.getsize(self.raw_2m_csv_filename) > 0
+        )
+
+        # 15m bar CSV 持久化配置----保存15mins K线数据文件定义
+        self.raw_15m_csv_filename = os.path.join(
+            ensure_log_dir(), f"{self.symbol}-15m-{today_str}.csv"
+        )
+        self.last_15m_saved_dt = None  # 增量写入指针（避免重复写）
+        self.raw_15m_csv_header_written = (
+            os.path.exists(self.raw_15m_csv_filename)
+            and os.path.getsize(self.raw_15m_csv_filename) > 0
+        )
+        # 日志文件命名定义
         self.log_filename = os.path.join(
             ensure_log_dir(), f"{today_str}_{self.symbol}_Sys_log.txt"
         )
+        # 成交记录文件定义
         self.trade_filename = os.path.join(
             shared.ensure_log_dir(), f"{today_str}_{self.symbol}_Trade_log.csv"
+        )
+        self.sys_log(
+            f"⚙️ [参数加载] eb_body_quantile={self.eb_body_quantile}, stop_min_gap={self.stop_min_gap}",
+            level="DEBUG",
         )
         self.sys_log(f"✅{symbol}的变量初始化工作完成", level="INFO")
 
@@ -311,6 +360,52 @@ class TradingContext:
             pass
 
     log = sys_log  # 别名，方便调用
+
+    def _persist_2m_csv(self, df_2m: pd.DataFrame):
+        """增量持久化 2m K 线到 CSV（去重 + 统一列）"""
+        try:
+            if df_2m is None or df_2m.empty or "datetime" not in df_2m.columns:
+                return
+
+            to_save = df_2m.copy()
+
+            # 只保存未写入过的增量
+            if getattr(self, "last_2m_saved_dt", None) is not None:
+                to_save = to_save[to_save["datetime"] > self.last_2m_saved_dt]
+
+            if to_save.empty:
+                return
+
+            to_save = to_save.sort_values("datetime").copy()
+            to_save["datetime"] = pd.to_datetime(to_save["datetime"], errors="coerce")
+            to_save = to_save[to_save["datetime"].notna()]
+
+            if to_save.empty:
+                return
+
+            last_saved_dt = to_save["datetime"].max()
+            to_save["datetime"] = to_save["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+            export_cols = [
+                c
+                for c in ["datetime", "open", "high", "low", "close", "volume"]
+                if c in to_save.columns
+            ]
+            to_save = to_save[export_cols]
+
+            to_save.to_csv(
+                self.raw_2m_csv_filename,
+                mode="a",
+                index=False,
+                header=not self.raw_2m_csv_header_written,
+                encoding="utf-8-sig",
+            )
+
+            self.raw_2m_csv_header_written = True
+            self.last_2m_saved_dt = last_saved_dt
+
+        except Exception as e:
+            self.sys_log(f"⚠️ [2m CSV写入失败] {e}", level="WARN")
 
     async def check_subscription_async(self, timeout=5):
         """[类方法] 行情权限审计：异步验证实时是否具有实时行情权限"""
@@ -548,7 +643,7 @@ class TradingContext:
                 )
             # --- 4. 判定是否触发今日熔断 ---
             # 逻辑 4.1：战术熔断（原有逻辑：连续 3 次触及初始止损底线失败）
-            is_tactical_suspend = self.consecutive_losses >= 3
+            is_tactical_suspend = self.consecutive_losses >= 2
             # 逻辑 4.2：财务熔断（新增建议：个股亏损超过 3 倍 Risk Unit）
             # 假设 risk_unit 是 120，亏损 360 就停
             max_pnl_loss = -(3 * getattr(self, "risk_unit", 120))
@@ -558,7 +653,7 @@ class TradingContext:
                 self.suspend_today = True
                 self.play_sound("SUSPEND")
                 reason = (
-                    "连续止损3次"
+                    "连续止损2次"
                     if is_tactical_suspend
                     else f"今日本股票{self.symbol}已经亏损{self.pnl_total}超过当日上限({max_pnl_loss})"
                 )
@@ -724,25 +819,14 @@ class TradingContext:
                 else 0.20
             )
 
-            # --- 6. 物理落地 CSV ---
-            safe_time_str = end_time_str.replace(":", "-")
-            K_LINE_FILE = os.path.join(
-                shared.ensure_log_dir(), f"{self.symbol}-2min-Kline-{safe_time_str}.csv"
-            )
-            try:
-                raw_df.to_csv(K_LINE_FILE, index=False)
-            except Exception as e:
-                self.sys_log(f"⚠️ CSV 写入失败，错误代码: {e}", level="WARN")
-
             # --- 7. ✨ 核心物理隔离操作 ✨ ---
-
             # A. 填充 2min 成品仓库 (面包库)
             self.history_2min_bars = raw_df.copy()
-
-            # B. 绝对排空 5s 缓冲区 (确保启动瞬间补票逻辑触发)
+            # B . 增量持久化 2m K线（历史加载阶段）---
+            self._persist_2m_csv(self.history_2min_bars)
+            # C. 绝对排空 5s 缓冲区 (确保启动瞬间补票逻辑触发)
             self.raw_5s_buffer = pd.DataFrame()
-
-            # C. 锚定最后时刻 (去掉秒数，确保与 2min 节点严格对齐)
+            # D. 锚定最后时刻 (去掉秒数，确保与 2min 节点严格对齐)
             last_bar_time = raw_df["datetime"].iloc[-1].replace(second=0, microsecond=0)
             # ✨ [开盘对齐补丁]：如果历史数据停留在昨日，且当前已接近或处于今日交易时段
             # 则强制将锚点对齐到今日 09:30，物理跳过隔夜空档，防止合成器刷屏
@@ -777,8 +861,8 @@ class TradingContext:
             self.green_bar_count = 0
             self.last_red_count = 0
             self.last_green_count = 0
-            self.high_of_bounce = 0.0
-            self.low_of_dip = 0.0
+            # self.high_of_bounce = 0.0
+            # self.low_of_dip = 0.0
 
             if not today_bars.empty:
                 for _, bar in today_bars.iterrows():
@@ -787,7 +871,7 @@ class TradingContext:
                             self.last_red_count = self.red_bar_count
                             self.green_bar_count = 1
                             self.high_of_bounce = bar["high"]
-                            self.low_of_dip = 0.0
+                            # self.low_of_dip = 0.0
                         else:
                             self.green_bar_count += 1
                             self.high_of_bounce = max(self.high_of_bounce, bar["high"])
@@ -797,7 +881,7 @@ class TradingContext:
                             self.last_green_count = self.green_bar_count
                             self.red_bar_count = 1
                             self.low_of_dip = bar["low"]
-                            self.high_of_bounce = 0.0
+                            # self.high_of_bounce = 0.0
                         else:
                             self.red_bar_count += 1
                             self.low_of_dip = (
@@ -884,7 +968,7 @@ class TradingContext:
                 EASTERN_TZ
             )
 
-            # --- 🛠️ 3. 核心改进：无损增量缝合 (防止数据失血) ---
+            # --- 🛠️ 3.1 核心改进：无损增量缝合 (防止数据失血) ---
             if not hasattr(self, "kline_cache_15m") or is_init:
                 # 初始态或强制初始化：全量覆盖
                 self.kline_cache_15m = df.copy()
@@ -900,6 +984,62 @@ class TradingContext:
                 self.kline_cache_15m.sort_values("datetime", inplace=True)
                 # 保持 100 根左右的长度，足以应付 MA20/50 计算
                 self.kline_cache_15m = self.kline_cache_15m.tail(100)
+
+            # --- 3.2 持久化 15m K 线到 CSV（增量写入） ---
+            try:
+                if (
+                    isinstance(self.kline_cache_15m, pd.DataFrame)
+                    and not self.kline_cache_15m.empty
+                    and "datetime" in self.kline_cache_15m.columns
+                ):
+                    to_save = self.kline_cache_15m.copy()
+
+                    # 只保存未写入过的增量
+                    if getattr(self, "last_15m_saved_dt", None) is not None:
+                        to_save = to_save[to_save["datetime"] > self.last_15m_saved_dt]
+
+                    if not to_save.empty:
+                        to_save = to_save.sort_values("datetime").copy()
+                        to_save["datetime"] = pd.to_datetime(
+                            to_save["datetime"], errors="coerce"
+                        )
+                        to_save = to_save[to_save["datetime"].notna()]
+
+                        if not to_save.empty:
+                            last_saved_dt = to_save["datetime"].max()
+
+                            # 输出到秒级时间序列
+                            to_save["datetime"] = to_save["datetime"].dt.strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            )
+
+                            export_cols = [
+                                c
+                                for c in [
+                                    "datetime",
+                                    "open",
+                                    "high",
+                                    "low",
+                                    "close",
+                                    "volume",
+                                ]
+                                if c in to_save.columns
+                            ]
+                            to_save = to_save[export_cols]
+
+                            to_save.to_csv(
+                                self.raw_15m_csv_filename,
+                                mode="a",
+                                index=False,
+                                header=not self.raw_15m_csv_header_written,
+                                encoding="utf-8-sig",
+                            )
+
+                            self.raw_15m_csv_header_written = True
+                            self.last_15m_saved_dt = last_saved_dt
+
+            except Exception as e:
+                self.sys_log(f"⚠️ [15m CSV写入失败] {e}", level="WARN")
 
             # --- 🛡️ 4. 指标驱动：确保 15min 趋势实时更新 ---
             v_count = len(self.kline_cache_15m)
@@ -1037,14 +1177,17 @@ class TradingContext:
         )
         self.history_2min_bars.sort_values("datetime", inplace=True)
 
-        if len(self.history_2min_bars) >= 2:
-            last_two = self.history_2min_bars.iloc[-2:]
-            self.low_of_4min = last_two["low"].min()
-            self.high_of_4min = last_two["high"].max()
+        # --- 1.1 增量持久化 2m K线（实时合成/补票阶段）---
+        self._persist_2m_csv(self.history_2min_bars)
+
+        if len(self.history_2min_bars) >= 3:
+            last_five = self.history_2min_bars.iloc[-3:]
+            self.low_of_6min = last_five["low"].min()
+            self.high_of_6min = last_five["high"].max()
         else:
-            # 只有一根K线时，暂时用当前K线的值
-            self.low_of_4min = bar["low"]
-            self.high_of_4min = bar["high"]
+            # 不足5根K线时，暂时用当前K线的值
+            self.low_of_6min = bar["low"]
+            self.high_of_6min = bar["high"]
 
         # 2. 跨线探测 (这是您最关心的 15min 对齐)
         current_bar_close_time = bar["datetime"] + timedelta(minutes=2)
@@ -1060,15 +1203,17 @@ class TradingContext:
             async def sync_and_recalc(snapshot_bar=bar):
                 await load_vix_data_async(is_init=False)
                 success_k = await self.update_15m_cache(is_init=False)
+                self.calculate_indicators()  # 数据拿到了再算，没拿到不瞎算
+                self._detect_market_patterns(snapshot_bar)
+                self.active_signal = self.analyze_signals(
+                    bar["close"], shared.global_last_vix_close
+                )
                 if success_k:
-                    self.calculate_indicators()  # 数据拿到了再算，没拿到不瞎算
-                    self._detect_market_patterns(snapshot_bar)
-                    self.active_signal = self.analyze_signals(
-                        snapshot_bar["close"], shared.global_last_vix_close
-                    )
                     self.sys_log(
-                        f"🔄 [跨15分钟K线同步] 15min K线数据刷新，已注入决策流"
+                        f"🔄 [15分钟K线同步] 15min K线数据刷新成功，已注入决策流"
                     )
+                else:
+                    self.sys_log(f"🔄 [15分钟K线同步失败] 15min K线数据刷新刷新失败")
 
             asyncio.create_task(sync_and_recalc(bar))
         else:
@@ -1115,10 +1260,125 @@ class TradingContext:
 
                     # 3. 执行物理对账
                     await self.sync_initial_state()
-                    self.sys_log(f"[2分钟K线] 补票完成并已对账", level="INFO")
+                    self.sys_log(f"✅ [2分钟K线] 补票完成并已对账", level="INFO")
 
         except Exception as e:
             self.sys_log(f"🚨 [异步补票失败]，错误代码: {e}", level="ERROR")
+
+    def _check_pullback_orderly(self, count: int, direction: str) -> bool:
+        """
+        检查最近 count 根同色柱的"有序性"
+        direction: 'red'=回调(多头机会), 'green'=反弹(空头机会)
+
+        Velez正统：正常回调应"有序"——多头回调低点逐步下移，
+        空头反弹高点逐步上移，不允许中途出现大反向突破
+        """
+        if len(self.history_2min_bars) < count + 2:  # +2: 排除当前反色柱+安全余量
+            return False
+
+        # 提取回调/反弹期间的K线（排除当前反色柱）
+        recent_bars = self.history_2min_bars.iloc[-(count + 1) : -1].copy()
+        if len(recent_bars) < count:
+            return False
+
+        # 1) 颜色一致性校验（防御性）
+        for _, bar in recent_bars.iterrows():
+            if direction == "red" and bar["close"] >= bar["open"]:
+                return False  # 应该是红柱但出现绿/十字
+            if direction == "green" and bar["close"] <= bar["open"]:
+                return False  # 应该是绿柱但出现红/十字
+
+        highs = recent_bars["high"].values
+        lows = recent_bars["low"].values
+
+        # 2) 有序性检查：允许小幅反向，但不允许"大反向突破"
+        #    阈值1.5%：平衡正统性与市场噪音
+        for i in range(1, len(highs)):
+            if direction == "red":  # 🔴 多头回调：高点不应大幅上移（空头反扑）
+                if highs[i] > highs[i - 1] * 1.015:
+                    return False
+            else:  # 🟢 空头反弹：低点不应大幅下移（多头反扑）
+                if lows[i] < lows[i - 1] * 0.985:
+                    return False
+
+        return True
+
+    def _check_elephant_in_sequence(self, count: int, color: str) -> bool:
+        """
+        检查最近 count 根同色柱中是否包含"大象柱"（优化版）
+        Velez 建议：回调/反弹中出现大象柱通常意味着情绪失控，放弃 Law3
+
+        参考 detect_law1 的 Elephant Bar 判断逻辑：
+        1. 使用局部相对显著性（最近 7 根）替代全局 ATR
+        2. 检查实体质量（body_ratio）
+        3. 检查影线质量（少影线）
+        4. 省略成交量检查（Law3 回调期本应缩量）
+        """
+        if (
+            len(self.history_2min_bars) < count + 8
+        ):  # +8: count 根 + 当前反色柱 + 7 根比较基准
+            return False  # 数据不足，保守返回 False（不过滤）
+
+        # 提取回调/反弹期间的 K 线（排除当前反色柱）
+        recent_bars = self.history_2min_bars.iloc[-(count + 1) : -1]
+        if len(recent_bars) < count:
+            return False
+
+        # 提取左侧 7 根作为比较基准（参考 detect_law1）
+        left_df = self.history_2min_bars.iloc[-(count + 8) : -(count + 1)]
+        if len(left_df) < 7:
+            return False
+
+        # 计算左侧 7 根的波动范围和实体大小（参考 detect_law1 第 3 节）
+        prev7_ranges = (left_df["high"] - left_df["low"]).astype(float)
+        prev7_bodies = (left_df["close"] - left_df["open"]).abs().astype(float)
+
+        # 大象柱阈值：波动范围>75% 分位数 且 实体>75% 分位数
+        range_threshold = prev7_ranges.quantile(0.75)
+        body_threshold = prev7_bodies.quantile(0.75)
+
+        for _, bar in recent_bars.iterrows():
+            # 先确认颜色（只检查目标颜色的柱子）
+            if color == "red" and bar["close"] >= bar["open"]:
+                continue  # 不是红柱，跳过
+            if color == "green" and bar["close"] <= bar["open"]:
+                continue  # 不是绿柱，跳过
+
+            # 计算当前柱的几何特征
+            bar_range = float(bar["high"] - bar["low"])
+            body_size = float(abs(bar["close"] - bar["open"]))
+            bar_ratio = body_size / bar_range if bar_range > 0 else 0.0
+
+            # 计算影线
+            upper_wick = float(bar["high"] - max(bar["open"], bar["close"]))
+            lower_wick = float(min(bar["open"], bar["close"]) - bar["low"])
+
+            # ============================================
+            # Elephant Bar 判断（参考 detect_law1 第 3-4 节）
+            # ============================================
+            is_range_big = bar_range >= range_threshold
+            is_body_big = body_size >= body_threshold
+            is_body_quality_ok = bar_ratio >= 0.50  # 实体占比≥50%
+
+            # 影线质量检查（参考 detect_law1）
+            if color == "red":  # 🔴 红柱：下影线应短（空头强势）
+                wick_ok = (lower_wick <= 0.15 * body_size) and (
+                    upper_wick <= 0.35 * body_size
+                )
+            else:  # 🟢 绿柱：上影线应短（多头强势）
+                wick_ok = (upper_wick <= 0.15 * body_size) and (
+                    lower_wick <= 0.35 * body_size
+                )
+
+            # 综合判断：波动大 + 实体大 + 实体质量高 + 影线少 = 大象柱
+            is_elephant = (
+                is_range_big and is_body_big and is_body_quality_ok and wick_ok
+            )
+
+            if is_elephant:
+                return True  # 发现大象柱
+
+        return False  # 未发现大象柱
 
     def calculate_indicators(self):
         """
@@ -1218,17 +1478,17 @@ class TradingContext:
                 (df["high"] - df["low"]).rolling(window=14).mean().iloc[-1]
             )  # 瞬时体温
 
-            now_time = datetime.now(EASTERN_TZ).time()
-
+            # now_time = datetime.now(EASTERN_TZ).time()
+            now_time = current_bar_time.time()
             if now_time < time(10, 0):
                 # 🛡️ 最佳实践：在 10:00 之前，限制动态 ATR 的“破坏力”
                 # 强制动态值不能超过基准值的 1.5 倍，防止大象柱瞬间拉大止损空间
                 capped_dynamic = min(dynamic_atr, base_atr * 1.5)
                 # 使用 7:3 比例混合，基准占大头
                 self.effective_atr = round((base_atr * 0.7) + (capped_dynamic * 0.3), 4)
-                self.sys_log(
-                    f"🧬 [ATR平滑] 早盘防御模式: 物理上限拦截生效", level="DEBUG"
-                )
+                # self.sys_log(
+                #    f"🧬 [ATR平滑] 早盘防御模式: 物理上限拦截生效", level="DEBUG"
+                # )
             elif now_time < time(10, 30):
                 # 过渡期：逐步放开限制，改为 5:5 比例
                 self.effective_atr = round((base_atr * 0.5) + (dynamic_atr * 0.5), 4)
@@ -1237,6 +1497,10 @@ class TradingContext:
                 self.effective_atr = max(round(dynamic_atr, 4), 0.20)
 
             self.atr = self.effective_atr
+            # self.stop_min_gap = max(0.25, min(self.static_atr, 1.20))
+            self.sys_log(
+                f"🔍 [stop_min_gap] current value: {self.stop_min_gap}", level="DEBUG"
+            )
 
             # --- 6. 大象柱辅助数据 (对齐原有 06-9 逻辑) ---
             # 提取倒数第21到第2根（不含当前根）用于计算平均波动
@@ -1258,7 +1522,7 @@ class TradingContext:
                         self.last_red_count = self.red_bar_count  # 备份压抑红柱数
                         self.green_bar_count = 1  # ✨ 恢复：确认为第一根反转
                         self.high_of_bounce = last_bar["high"]  # 初始化上涨极值
-                        self.low_of_dip = 0.0  # 结束下跌，重置锚点
+
                         self.sys_log(
                             f"📊 红绿柱记数器|🔴连续下跌:{self.last_red_count}根红柱之后，出现第1根上涨🟢绿柱"
                         )
@@ -1279,7 +1543,7 @@ class TradingContext:
                         self.last_green_count = self.green_bar_count  # 备份上涨绿柱数
                         self.red_bar_count = 1  # ✨ 对称恢复：确认为第一根反转
                         self.low_of_dip = last_bar["low"]  # 初始化下跌极值
-                        self.high_of_bounce = 0.0  # 结束上涨，重置锚点
+
                         self.sys_log(
                             f"📊 红绿柱记数器|🟢连续上涨:{self.last_green_count}根绿柱之后，出现第1根下跌🔴红柱"
                         )
@@ -1301,10 +1565,97 @@ class TradingContext:
                         f"📊 红绿柱记数器|这是一根十字星K线，之前有:🔴连续下跌红柱:{self.red_bar_count}根 | 🟢连续上涨绿柱:{self.green_bar_count}根"
                     )
                     pass
+
+                # --- 8. 更新时间哨兵 (try 块末尾) ---
                 self.last_processed_time = current_bar_time
+
+                # --- 9. Law3 预检日志 (增强版) ---
+                if 3 <= self.red_bar_count <= 5:
+                    slope_ok, slope_score, mono_ratio = self._check_ma20_slope(
+                        self.red_bar_count, "long"
+                    )
+                    self.sys_log(
+                        f"🔍 [Law3 预检] 🔴回调:{self.red_bar_count}根 | 斜率达标:{slope_ok} | 强度:{slope_score:.4f} | 单调性:{mono_ratio:.2f}",
+                        level="DEBUG",
+                    )
+                if 3 <= self.green_bar_count <= 5:
+                    slope_ok, slope_score, mono_ratio = self._check_ma20_slope(
+                        self.green_bar_count, "short"
+                    )
+                    self.sys_log(
+                        f"🔍 [Law3 预检] 🟢反弹:{self.green_bar_count}根 | 斜率达标:{slope_ok} | 强度:{slope_score:.4f} | 单调性:{mono_ratio:.2f}",
+                        level="DEBUG",
+                    )
 
         except Exception as e:
             self.sys_log(f"🚨 [指标计算异常] {self.symbol}: {e}", level="ERROR")
+
+    def _check_ma20_slope(self, pullback_count, direction):
+        """
+        [Law2/Law3/Law4 共用趋势背景检查] 检查“回调发生前”MA20 是否已经形成一段可见趋势
+
+        支持范围：
+        - Law3: pullback_count = 3~5
+        - Law4: pullback_count = 1~2
+
+        返回：
+        - (is_ok, slope_score, monotonic_ratio)
+        """
+        # ✅ 修改：支持 1-5 根回调 (兼容 Law3 和 Law4)
+        if pullback_count < 1 or pullback_count > 5:
+            return False, 0.0, 0.0
+
+        ma20_series = getattr(self, "ma20_series_cache", None)
+        if ma20_series is None:
+            return False, 0.0, 0.0
+
+        ma20_valid = ma20_series.dropna()
+        # 确保有足够的数据：回调前趋势段 + 回调段 + 当前柱
+        if len(ma20_valid) < (pullback_count + 10):
+            return False, 0.0, 0.0
+
+        atr = max(float(getattr(self, "atr", 0.0) or 0.0), 0.01)
+
+        # ===== 参数 =====
+        PRETREND_LOOKBACK = 6  # 回调发生前观察 6 根 2 分钟 bar
+        MIN_SLOPE_PER_BAR = 0.03  # 每 bar 的 ATR 归一化斜率阈值
+        MIN_MONOTONIC_RATIO = 0.60  # 单调性阈值 (Law4 可适当放宽，但此处统一)
+
+        # 索引计算：
+        # 当前 bar = 0 (翻转柱/Reclaim 柱)
+        # 回调段 = -1 到 -pullback_count
+        # 趋势段终点 = -(pullback_count + 1)
+        end_pos = len(ma20_valid) - pullback_count - 2
+        start_pos = end_pos - PRETREND_LOOKBACK + 1
+
+        if start_pos < 0 or end_pos <= start_pos:
+            return False, 0.0, 0.0
+
+        seg = ma20_valid.iloc[start_pos : end_pos + 1]
+        if len(seg) < PRETREND_LOOKBACK:
+            return False, 0.0, 0.0
+
+        diffs = seg.diff().dropna()
+        if len(diffs) == 0:
+            return False, 0.0, 0.0
+
+        total_delta = float(seg.iloc[-1] - seg.iloc[0])
+        slope_score = total_delta / (len(seg) * atr)
+
+        if direction == "long":
+            monotonic_ratio = float((diffs > 0).mean())
+            is_ok = (slope_score >= MIN_SLOPE_PER_BAR) and (
+                monotonic_ratio >= MIN_MONOTONIC_RATIO
+            )
+        elif direction == "short":
+            monotonic_ratio = float((diffs < 0).mean())
+            is_ok = (slope_score <= -MIN_SLOPE_PER_BAR) and (
+                monotonic_ratio >= MIN_MONOTONIC_RATIO
+            )
+        else:
+            return False, 0.0, 0.0
+
+        return bool(is_ok), round(slope_score, 4), round(monotonic_ratio, 4)
 
     def _detect_tail_bars(self, new_bar):
         """
@@ -1381,21 +1732,350 @@ class TradingContext:
                 )
                 return
 
+    def _clear_law1_pending(self):
+        self.law1_pending = None
+        self.law1_pending_bar_index = None
+        self.law1_pending_side = None
+        self.law1_pending_high = None
+        self.law1_pending_low = None
+        self.law1_pending_context = None
+        self.law1_pending_score = None
+        self.law1_pending_hard_clear = None
+
+    def _arm_law1_pending(
+        self,
+        side,
+        bar_index,
+        high,
+        low,
+        context,
+        score,
+        hard_clear,
+    ):
+        self.law1_pending = True
+        self.law1_pending_bar_index = bar_index
+        self.law1_pending_side = side
+        self.law1_pending_high = high
+        self.law1_pending_low = low
+        self.law1_pending_context = context
+        self.law1_pending_score = score
+        self.law1_pending_hard_clear = hard_clear
+
+    def _evaluate_law1_pending(self):
+        """
+        [Law1 GiftZone Pending 评估器 - 完整修订版]
+        职责：
+        1. 检查 pending 是否超时
+        2. 检查等待窗口内是否发生结构破坏
+        3. 检查是否先出现真实回踩/反弹
+        4. 检查当前 bar 是否构成 GiftZone 的确认 bar
+        5. 若成立，则返回标准 signal packet；否则返回 None
+
+        设计原则：
+        - GiftZone 不能在 Elephant Bar 当根确认
+        - GiftZone 必须先有回踩/反弹，再有确认 bar
+        - LONG: 先回踩，再由当前 bar 转强确认
+        - SHORT: 先反弹，再由当前 bar 转弱确认
+        """
+
+        if not self.law1_pending:
+            return None
+
+        if self.history_2min_bars is None or self.history_2min_bars.empty:
+            return None
+
+        bars_df = self.history_2min_bars
+        if len(bars_df) < 2:
+            return None
+
+        current_bar_index = len(bars_df) - 1
+        pending_bar_index = self.law1_pending_bar_index
+        bars_elapsed = current_bar_index - pending_bar_index
+
+        # ---------------------------------------------------------
+        # 0) GiftZone 不能在 Elephant Bar 当根确认
+        # 必须至少等到下一根 bar，bars_elapsed >= 1
+        # ---------------------------------------------------------
+        if bars_elapsed < 1:
+            return None
+
+        # ---------------------------------------------------------
+        # 1) 超时失效
+        # GiftZone 最多等待 3 根 bar
+        # elephant 当根 index = pending_bar_index
+        # 下一根开始 bars_elapsed = 1
+        # ---------------------------------------------------------
+        if bars_elapsed > 3:
+            self.sys_log(
+                f"⌛ [Law1_GiftZone] pending超时失效"
+                f" | side:{self.law1_pending_side}"
+                f" | elapsed:{bars_elapsed}",
+                level="INFO",
+            )
+            self._clear_law1_pending()
+            return None
+
+        side = self.law1_pending_side
+        elephant_high = float(self.law1_pending_high)
+        elephant_low = float(self.law1_pending_low)
+        elephant_range = max(elephant_high - elephant_low, 1e-8)
+
+        # 当前 bar / 前一根 bar
+        current_bar = bars_df.iloc[-1]
+        prev_bar = bars_df.iloc[-2]
+
+        cur_open = float(current_bar["open"])
+        cur_high = float(current_bar["high"])
+        cur_low = float(current_bar["low"])
+        cur_close = float(current_bar["close"])
+
+        prev_open = float(prev_bar["open"])
+        prev_high = float(prev_bar["high"])
+        prev_low = float(prev_bar["low"])
+        prev_close = float(prev_bar["close"])
+
+        # ---------------------------------------------------------
+        # 2) 提取 Elephant 之后、当前 bar 之前的等待窗口
+        # 这些是“已经发生的 pullback / rebound bars”
+        # 不包含当前 bar，因为当前 bar 是候选 confirm bar
+        # ---------------------------------------------------------
+        if current_bar_index > pending_bar_index + 1:
+            pullback_df = bars_df.iloc[pending_bar_index + 1 : current_bar_index].copy()
+        else:
+            pullback_df = bars_df.iloc[0:0].copy()  # 空df
+
+        has_pullback_window = len(pullback_df) > 0
+
+        # 等待窗口统计
+        window_low_min = None
+        window_high_max = None
+        pullback_depth = 0.0
+
+        if has_pullback_window:
+            window_low_min = float(pullback_df["low"].astype(float).min())
+            window_high_max = float(pullback_df["high"].astype(float).max())
+
+            if side == "LONG":
+                pullback_depth = elephant_high - window_low_min
+            elif side == "SHORT":
+                pullback_depth = window_high_max - elephant_low
+
+        # ---------------------------------------------------------
+        # 3) 等待窗口内结构破坏检查（比只看当前 bar 更完整）
+        # ---------------------------------------------------------
+        if side == "LONG":
+            # 任意等待窗口 bar 跌破 elephant_low，直接失效
+            if has_pullback_window and window_low_min <= elephant_low:
+                self.sys_log(
+                    f"🚫 [Law1L_GiftZone] LONG pending失效：等待窗口内跌破象柱低点"
+                    f" | window_low_min:{window_low_min:.2f}"
+                    f" | elephant_low:{elephant_low:.2f}",
+                    level="INFO",
+                )
+                self._clear_law1_pending()
+                return None
+
+            # 当前确认 bar 自己也不能跌破 elephant_low
+            if cur_low <= elephant_low:
+                self.sys_log(
+                    f"🚫 [Law1L_GiftZone] LONG pending失效：当前bar跌破象柱低点"
+                    f" | cur_low:{cur_low:.2f}"
+                    f" | elephant_low:{elephant_low:.2f}",
+                    level="INFO",
+                )
+                self._clear_law1_pending()
+                return None
+
+            # 等待窗口内回踩过深，视为失效
+            if has_pullback_window and pullback_depth > (2.0 / 3.0) * elephant_range:
+                self.sys_log(
+                    f"🚫 [Law1L_GiftZone] LONG pending失效：等待窗口回踩过深(>2/3)"
+                    f" | depth:{pullback_depth:.2f}"
+                    f" | range:{elephant_range:.2f}",
+                    level="INFO",
+                )
+                self._clear_law1_pending()
+                return None
+
+        elif side == "SHORT":
+            # 任意等待窗口 bar 突破 elephant_high，直接失效
+            if has_pullback_window and window_high_max >= elephant_high:
+                self.sys_log(
+                    f"🚫 [Law1S_GiftZone] SHORT pending失效：等待窗口内突破象柱高点"
+                    f" | window_high_max:{window_high_max:.2f}"
+                    f" | elephant_high:{elephant_high:.2f}",
+                    level="INFO",
+                )
+                self._clear_law1_pending()
+                return None
+
+            # 当前确认 bar 自己也不能突破 elephant_high
+            if cur_high >= elephant_high:
+                self.sys_log(
+                    f"🚫 [Law1S_GiftZone] SHORT pending失效：当前bar突破象柱高点"
+                    f" | cur_high:{cur_high:.2f}"
+                    f" | elephant_high:{elephant_high:.2f}",
+                    level="INFO",
+                )
+                self._clear_law1_pending()
+                return None
+
+            # 等待窗口内反弹过深，视为失效
+            if has_pullback_window and pullback_depth > (2.0 / 3.0) * elephant_range:
+                self.sys_log(
+                    f"🚫 [Law1S_GiftZone] SHORT pending失效：等待窗口反弹过深(>2/3)"
+                    f" | depth:{pullback_depth:.2f}"
+                    f" | range:{elephant_range:.2f}",
+                    level="INFO",
+                )
+                self._clear_law1_pending()
+                return None
+
+        else:
+            self._clear_law1_pending()
+            return None
+
+        # ---------------------------------------------------------
+        # 4) 必须先出现真实回踩 / 反弹
+        # GiftZone 的核心：不是普通 follow-through，而是先回踩再恢复
+        #
+        # 最小可操作定义：
+        # LONG:
+        #   - bars_elapsed == 1 时：当前 bar 不能直接确认为 GiftZone（因为还没出现过回踩窗口）
+        #   - bars_elapsed >= 2 时：等待窗口里至少出现一根“回踩 bar”
+        #
+        # SHORT:
+        #   - 同理，至少出现一根“反弹 bar”
+        # ---------------------------------------------------------
+        if side == "LONG":
+            if not has_pullback_window:
+                return None
+
+            # 定义“回踩 bar”：
+            # 1) 收阴；或
+            # 2) low 低于上一参考高位区域（这里用 elephant_high 代表向下回踩）
+            has_real_pullback = False
+            for _, row in pullback_df.iterrows():
+                ro = float(row["open"])
+                rc = float(row["close"])
+                rl = float(row["low"])
+
+                if (rc < ro) or (rl < elephant_high):
+                    has_real_pullback = True
+                    break
+
+            if not has_real_pullback:
+                return None
+
+        elif side == "SHORT":
+            if not has_pullback_window:
+                return None
+
+            # 定义“反弹 bar”：
+            # 1) 收阳；或
+            # 2) high 高于下一参考低位区域（这里用 elephant_low 代表向上反弹）
+            has_real_rebound = False
+            for _, row in pullback_df.iterrows():
+                ro = float(row["open"])
+                rc = float(row["close"])
+                rh = float(row["high"])
+
+                if (rc > ro) or (rh > elephant_low):
+                    has_real_rebound = True
+                    break
+
+            if not has_real_rebound:
+                return None
+
+        # ---------------------------------------------------------
+        # 5) 当前 bar 必须是“回踩结束后的确认 bar”
+        #
+        # LONG 确认 bar：
+        # - 当前 bar 收阳
+        # - 当前高点 > 前一根高点
+        # - 当前低点 >= 前一根低点（避免只是剧烈震荡）
+        #
+        # SHORT 确认 bar：
+        # - 当前 bar 收阴
+        # - 当前低点 < 前一根低点
+        # - 当前高点 <= 前一根高点
+        # ---------------------------------------------------------
+        if side == "LONG":
+            gift_confirmed = (
+                (cur_close > cur_open)
+                and (cur_high > prev_high)
+                and (cur_low >= prev_low)
+            )
+
+            if not gift_confirmed:
+                return None
+
+            packet = {
+                "side": "LONG",
+                "label": "Law1L_GiftZone",
+                "raw_sl": elephant_low,
+                "trigger_high": cur_high,
+                "trigger_low": elephant_low,
+                "entry_type": "GiftZone",
+            }
+
+            self.sys_log(
+                f"🎁🟢 [Law1L_GiftZone确认] LONG"
+                f" | triggerH:{cur_high:.2f}"
+                f" | raw_sl:{elephant_low:.2f}"
+                f" | elapsed:{bars_elapsed}"
+                f" | pullback_depth:{pullback_depth:.2f}",
+                level="INFO",
+            )
+            return packet
+
+        if side == "SHORT":
+            gift_confirmed = (
+                (cur_close < cur_open)
+                and (cur_low < prev_low)
+                and (cur_high <= prev_high)
+            )
+
+            if not gift_confirmed:
+                return None
+
+            packet = {
+                "side": "SHORT",
+                "label": "Law1S_GiftZone",
+                "raw_sl": elephant_high,
+                "trigger_high": elephant_high,
+                "trigger_low": cur_low,
+                "entry_type": "GiftZone",
+            }
+
+            self.sys_log(
+                f"🎁🔴 [Law1S_GiftZone确认] SHORT"
+                f" | triggerL:{cur_low:.2f}"
+                f" | raw_sl:{elephant_high:.2f}"
+                f" | elapsed:{bars_elapsed}"
+                f" | rebound_depth:{pullback_depth:.2f}",
+                level="INFO",
+            )
+            return packet
+
+        return None
+
     def _detect_law1(self, new_bar):
         """
-        [Law #1 - Velez Orthodox Version]
+        [Law #1 - Velez Orthodox Version | Breakout + GiftZone Pending]
         职责：
-            识别最贴近 Oliver Velez 原教旨定义的 Elephant Bar / Clearing Elephant Bar。
+            1. 识别最贴近 Oliver Velez 原教旨定义的 Elephant Bar / Clearing Elephant Bar
+            2. 对“强Law1”直接输出 Breakout
+            3. 对“中等但合格Law1”挂起为 GiftZone pending，等待后续 bar 再确认
 
-        核心思想：
-        1. 不再使用 ATR 作为 Elephant 主判定
-        2. 使用“左侧局部相对显著性”替代 ATR 倍数
-        3. 引入 Clearing / 20MA附近 / Breakout / Trend Restart
-        4. 成交量仅作为加分项，不再是硬门槛
+        注意：
+            本函数不负责 GiftZone 的最终成熟确认。
+            GiftZone 的确认、超时、失效，应在 analyze_signals() 里处理。
         """
 
         # =========================================================
-        # 0) 初始化标志位，防止旧状态污染
+        # 0) 初始化“当根即时信号位”，防止旧状态污染
+        #    注意：不能清理 law1_pending*，那是跨bar状态
         # =========================================================
         self.ready_to_long_law1 = False
         self.ready_to_short_law1 = False
@@ -1439,9 +2119,7 @@ class TradingContext:
             return
 
         bars_df = self.history_2min_bars
-        left_df = bars_df.iloc[
-            :-1
-        ].copy()  # 当前 bar 已经 append 到 history_2min_bars，左侧必须排除最后一根
+        left_df = bars_df.iloc[:-1].copy()  # 当前 bar 已 append，左侧必须排除最后一根
 
         if len(left_df) < 20:
             return
@@ -1474,7 +2152,6 @@ class TradingContext:
 
         # =========================================================
         # 3) 左侧相对显著性（替代 ATR）
-        #    compare_n = 7：更贴近“周围 bars”的视觉判断
         # =========================================================
         compare_n = 7
         prev7 = left_df.tail(compare_n).copy()
@@ -1484,10 +2161,13 @@ class TradingContext:
         prev7_ranges = (prev7["high"] - prev7["low"]).astype(float)
         prev7_bodies = (prev7["close"] - prev7["open"]).abs().astype(float)
 
-        is_body_majority_big = body_size >= prev7_bodies.quantile(0.80)
-        is_range_majority_big = bar_range >= prev7_ranges.quantile(0.80)
-        is_body_near_local_max = body_size >= 0.90 * prev7_bodies.max()
-
+        is_body_majority_big = body_size >= prev7_bodies.quantile(self.eb_body_quantile)
+        is_range_majority_big = bar_range >= prev7_ranges.quantile(
+            self.eb_range_quantile
+        )
+        is_body_near_local_max = (
+            body_size >= self.eb_body_max_ratio * prev7_bodies.max()
+        )
         is_prominent = (
             is_body_majority_big and is_range_majority_big and is_body_near_local_max
         )
@@ -1495,12 +2175,9 @@ class TradingContext:
         # =========================================================
         # 4) 实体厚实 + 少影线
         # =========================================================
-        body_ok = body_ratio >= 0.70
+        body_ok = body_ratio >= self.eb_body_ratio
 
-        # Bull Elephant：上影线要短，下影线可稍放宽
         bull_wick_ok = upper_wick <= 0.15 * body_size and lower_wick <= 0.35 * body_size
-
-        # Bear Elephant：下影线要短，上影线可稍放宽
         bear_wick_ok = lower_wick <= 0.15 * body_size and upper_wick <= 0.35 * body_size
 
         quality_ok = body_ok and (
@@ -1509,7 +2186,6 @@ class TradingContext:
 
         # =========================================================
         # 5) Clearing Elephant Bar
-        #    至少清掉左侧连续 3 根反色 bars
         # =========================================================
         max_clearing_scan = 5
         min_clearing_bars = 3
@@ -1549,20 +2225,14 @@ class TradingContext:
             opp_body_bottom_min = float(opp_df[["open", "close"]].min(axis=1).min())
 
             if is_bull:
-                # Soft clear：收盘越过反色实体区，且高点刺穿对方高点
                 soft_clear = (c > opp_body_top_max) and (h > opp_high_max)
-                # Hard clear：收盘直接越过反色bars最高点
                 hard_clear = c > opp_high_max
             else:
-                # Soft clear：收盘跌破反色实体区，且低点刺穿对方低点
                 soft_clear = (c < opp_body_bottom_min) and (l < opp_low_min)
-                # Hard clear：收盘直接跌破反色bars最低点
                 hard_clear = c < opp_low_min
 
         # =========================================================
         # 5.1 Clearing 记忆交叉校验
-        # opposite_count = 当前回扫事实
-        # last_red_count / last_green_count = 状态机记忆事实
         # =========================================================
         last_opposite_count = 0
         if is_bull:
@@ -1585,7 +2255,6 @@ class TradingContext:
 
         # ---------------------------------------------------------
         # 6.1 20MA附近
-        # 不再用 ATR，用当前 bar 自身 range 归一化
         # ---------------------------------------------------------
         if is_bull:
             is_near_ma20 = (
@@ -1620,14 +2289,12 @@ class TradingContext:
 
         # ---------------------------------------------------------
         # 6.3 趋势重启（Trend Restart）
-        # 直接利用 calculate_indicators() 的结果
         # ---------------------------------------------------------
         restart_lookback = 4
         prev4 = left_df.tail(restart_lookback).copy()
         if len(prev4) < restart_lookback:
             return
 
-        # 最近 4 根里是否有 pullback 接近 20MA
         touched_ma20 = False
         for _, row in prev4.iterrows():
             rh = float(row["high"])
@@ -1643,7 +2310,6 @@ class TradingContext:
                     touched_ma20 = True
                     break
 
-        # 趋势条件
         bull_trend_ok = (
             ma200 is not None
             and ma20 > ma200
@@ -1665,7 +2331,7 @@ class TradingContext:
             )
 
         # =========================================================
-        # 7) 评分制：至少 2 分
+        # 7) 评分制
         # =========================================================
         score = 0
         if soft_clear:
@@ -1678,7 +2344,7 @@ class TradingContext:
             score += 1
         if is_restart:
             score += 1
-        if vol_ratio >= 1.20:
+        if vol_ratio >= self.eb_vol_mult:
             score += 1
         if clearing_memory_confirmed:
             score += 1
@@ -1699,7 +2365,7 @@ class TradingContext:
             self.law1_context = "Generic"
 
         # =========================================================
-        # 8) 最终触发：硬门槛 + 评分门槛
+        # 8) 最终硬门槛
         # =========================================================
         hard_gates_pass = is_prominent and quality_ok
 
@@ -1710,8 +2376,7 @@ class TradingContext:
             return
 
         # =========================================================
-        # 9) 生成 Law1 信号
-        # 止损：象柱另一端 + 当前 bar range 的 10% buffer
+        # 9) 记录 Elephant 几何
         # =========================================================
         buffer = 0.10 * bar_range
 
@@ -1720,65 +2385,152 @@ class TradingContext:
         self.law1_elephant_open = o
         self.law1_elephant_close = c
 
-        if is_bull:
-            self.ready_to_long_law1 = True
-            self.law1_sl = l - buffer
-            self.law1_trigger_high = self.law1_elephant_high
-            self.law1_trigger_low = self.law1_elephant_low
-            self.law1_entry_type = "Breakout"
-            self.sys_log(
-                f"🐘 [Law#1-Velez]🟢Bull Elephant"
-                f"|score:{score}"
-                f"|量比:{vol_ratio:.2f}"
-                f"|实体占比:{body_ratio:.2f}"
-                f"|opp_count:{opposite_count}"
-                f"|last_opp:{last_opposite_count}"
-                f"|mem_ok:{clearing_memory_confirmed}"
-                f"|clear_ok:{clear_consistency_ok}"
-                f"|soft_clear:{soft_clear}"
-                f"|hard_clear:{hard_clear}"
-                f"|ctx:{self.law1_context}"
-                f"|SL:{self.law1_sl:.2f}",
-                level="INFO",
+        side = "LONG" if is_bull else "SHORT"
+
+        # =========================================================
+        # 10) 分类：强Law1 => Breakout；中等Law1 => GiftZone pending
+        # =========================================================
+        is_strong_breakout = hard_clear or (
+            score >= 4 and self.law1_context in ("TrendRestart", "Near20MA")
+        )
+
+        # ---------------------------------------------------------
+        # 10.1 强Law1：直接输出 Breakout（保留原功能）
+        # ---------------------------------------------------------
+        if is_strong_breakout:
+            if is_bull:
+                self.ready_to_long_law1 = True
+                self.law1_sl = l - buffer
+                self.law1_trigger_high = h
+                self.law1_trigger_low = l
+                self.law1_entry_type = "Breakout"
+                self.sys_log(
+                    f"🐘 [Law1L-Velez]🟢Bull Elephant"
+                    f"|mode:Breakout"
+                    f"|score:{score}"
+                    f"|量比:{vol_ratio:.2f}"
+                    f"|实体占比:{body_ratio:.2f}"
+                    f"|opp_count:{opposite_count}"
+                    f"|last_opp:{last_opposite_count}"
+                    f"|mem_ok:{clearing_memory_confirmed}"
+                    f"|clear_ok:{clear_consistency_ok}"
+                    f"|soft_clear:{soft_clear}"
+                    f"|hard_clear:{hard_clear}"
+                    f"|ctx:{self.law1_context}"
+                    f"|SL:{self.law1_sl:.2f}",
+                    level="INFO",
+                )
+            else:
+                self.ready_to_short_law1 = True
+                self.law1_sl = h + buffer
+                self.law1_trigger_high = h
+                self.law1_trigger_low = l
+                self.law1_entry_type = "Breakout"
+                self.sys_log(
+                    f"🐘 [Law1S-Velez]🔴Bear Elephant"
+                    f"|mode:Breakout"
+                    f"|score:{score}"
+                    f"|量比:{vol_ratio:.2f}"
+                    f"|实体占比:{body_ratio:.2f}"
+                    f"|opp_count:{opposite_count}"
+                    f"|last_opp:{last_opposite_count}"
+                    f"|mem_ok:{clearing_memory_confirmed}"
+                    f"|clear_ok:{clear_consistency_ok}"
+                    f"|soft_clear:{soft_clear}"
+                    f"|hard_clear:{hard_clear}"
+                    f"|ctx:{self.law1_context}"
+                    f"|SL:{self.law1_sl:.2f}",
+                    level="INFO",
+                )
+            return
+
+        # ---------------------------------------------------------
+        # 10.2 中等Law1：挂起为 GiftZone pending
+        # ---------------------------------------------------------
+        # 这里只负责挂起，不直接产生 ready_to_long/short_law1
+        current_bar_index = len(bars_df) - 1
+
+        new_score = score
+        new_hard_clear = hard_clear
+        old_score = getattr(self, "law1_pending_score", None)
+        old_hard_clear = getattr(self, "law1_pending_hard_clear", None)
+
+        should_replace_old_pending = False
+        if self.law1_pending:
+            should_replace_old_pending = (
+                (new_hard_clear and not bool(old_hard_clear))
+                or (old_score is None)
+                or (new_score >= old_score + 1)
             )
 
-        elif is_bear:
-            self.ready_to_short_law1 = True
-            self.law1_sl = h + buffer
-            self.law1_trigger_high = self.law1_elephant_high
-            self.law1_trigger_low = self.law1_elephant_low
-            self.law1_entry_type = "Breakout"
+        if not self.law1_pending:
+            self._arm_law1_pending(
+                side=side,
+                bar_index=current_bar_index,
+                high=h,
+                low=l,
+                context=self.law1_context,
+                score=score,
+                hard_clear=hard_clear,
+            )
+
             self.sys_log(
-                f"🐘 [Law#1-Velez]🔴Bear Elephant"
+                f"🎁 [Law1-{side}-GiftZone Pending] "
                 f"|score:{score}"
                 f"|量比:{vol_ratio:.2f}"
                 f"|实体占比:{body_ratio:.2f}"
-                f"|opp_count:{opposite_count}"
-                f"|last_opp:{last_opposite_count}"
-                f"|mem_ok:{clearing_memory_confirmed}"
-                f"|clear_ok:{clear_consistency_ok}"
                 f"|soft_clear:{soft_clear}"
                 f"|hard_clear:{hard_clear}"
                 f"|ctx:{self.law1_context}"
-                f"|SL:{self.law1_sl:.2f}",
+                f"|pending_high:{h:.2f}"
+                f"|pending_low:{l:.2f}",
+                level="INFO",
+            )
+            return
+
+        # 已有旧pending，只有新setup更强时才覆盖
+        if should_replace_old_pending:
+            self.sys_log(
+                f"🔁 [Law1-{side}-GiftZone Pending] 新Law1更强，覆盖旧pending"
+                f"|old_score:{old_score}"
+                f"|new_score:{new_score}"
+                f"|old_hard_clear:{old_hard_clear}"
+                f"|new_hard_clear:{new_hard_clear}",
+                level="INFO",
+            )
+            self._clear_law1_pending()
+            self._arm_law1_pending(
+                side=side,
+                bar_index=current_bar_index,
+                high=h,
+                low=l,
+                context=self.law1_context,
+                score=score,
+                hard_clear=hard_clear,
+            )
+            self.sys_log(
+                f"🎁 [Law1-{side}-GiftZone Pending]"
+                f"|score:{score}"
+                f"|量比:{vol_ratio:.2f}"
+                f"|实体占比:{body_ratio:.2f}"
+                f"|soft_clear:{soft_clear}"
+                f"|hard_clear:{hard_clear}"
+                f"|ctx:{self.law1_context}"
+                f"|pending_high:{h:.2f}"
+                f"|pending_low:{l:.2f}",
                 level="INFO",
             )
 
     def _detect_law2(self, new_bar):
         """
-        [Law #2] Color Change (Velez Orthodox Version)
-        职责：
-            识别在趋势语境中，连续 3~5 根同色压抑后的第一根高质量反色 K 线。
-
-        设计原则：
-        1. 保留 Velez 核心：3~5 根同色压抑 + 第一根反色柱
-        2. 去掉 ATR 实体门槛，改为反色柱自身形态质量审计
-        3. 引入趋势语境：顺 MA20/MA200 大方向
-        4. 引入位置语境：优先要求发生在 20MA 附近
+        [Law #2] Color Change (优化版 - 与 Law3/4 趋势逻辑对齐)
+        核心修复：
+        1. 趋势判断不再依赖 is_ma20_turning_up，改用 _check_ma20_slope
+        2. 确保与 Law3/4 共享同一套趋势定义标准
+        3. 增加失败诊断日志（便于调试）
         """
-
         # =========================================================
-        # 1) 初始化标志位，防止旧状态污染
+        # 1) 初始化标志位
         # =========================================================
         self.ready_to_long_law2 = False
         self.ready_to_short_law2 = False
@@ -1790,15 +2542,11 @@ class TradingContext:
         self.law2_entry_type = None
 
         # =========================================================
-        # 2) 物理审计：确保计算基础已就绪
+        # 2) 基础审计
         # =========================================================
-        if not hasattr(self, "ma20") or self.ma20 is None:
+        if self.ma20 is None or not hasattr(self, "ma200"):
             return
-        if not hasattr(self, "ma200"):
-            return
-        if not hasattr(self, "is_ma20_turning_up") or not hasattr(
-            self, "is_ma20_turning_down"
-        ):
+        if self.history_2min_bars is None or len(self.history_2min_bars) < 20:
             return
 
         # =========================================================
@@ -1811,39 +2559,54 @@ class TradingContext:
 
         is_green = c > o
         is_red = c < o
-
         bar_range = h - l
         body_size = abs(c - o)
-
         if bar_range <= 0 or body_size <= 0:
             return
-
-        upper_wick = h - max(o, c)
-        lower_wick = min(o, c) - l
-        body_ratio = body_size / bar_range if bar_range > 0 else 0.0
 
         ma20 = float(self.ma20)
         ma200 = float(self.ma200) if self.ma200 is not None else None
 
         # =========================================================
-        # 4) Law2 反色柱自身质量判定（替代 ATR 过滤）
-        #    Bull: 上影线不要太长
-        #    Bear: 下影线不要太长
+        # 4) 趋势语境 (✅ 核心修复：与 Law3 对齐)
         # =========================================================
-        bull_reversal_quality_ok = body_ratio >= 0.55 and upper_wick <= 0.35 * body_size
+        # ✅ 与 Law3 保持一致的写法
+        if 3 <= self.last_red_count <= 5:
+            bull_slope_ok, bull_slope_score, _ = self._check_ma20_slope(
+                self.last_red_count, "long"
+            )
+        else:
+            bull_slope_ok, bull_slope_score = False, 0.0
 
+        if 3 <= self.last_green_count <= 5:
+            bear_slope_ok, bear_slope_score, _ = self._check_ma20_slope(
+                self.last_green_count, "short"
+            )
+        else:
+            bear_slope_ok, bear_slope_score = False, 0.0
+
+        bull_trend_ok = ma200 is not None and ma20 > ma200 and bull_slope_ok
+        bear_trend_ok = ma200 is not None and ma20 < ma200 and bear_slope_ok
+
+        # =========================================================
+        # 5) 反色柱自身质量 (Law2 特有核心)
+        # =========================================================
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+        body_ratio = body_size / bar_range if bar_range > 0 else 0.0
+
+        # Law2 对反色柱质量要求较高（比 Law3 严格）
+        bull_reversal_quality_ok = body_ratio >= 0.55 and upper_wick <= 0.35 * body_size
         bear_reversal_quality_ok = body_ratio >= 0.55 and lower_wick <= 0.35 * body_size
 
         # =========================================================
-        # 5) 位置语境：当前反色柱是否发生在 20MA 附近
-        #    不再用 ATR，改用当前 bar 自身 range 归一化
+        # 6) 位置语境
         # =========================================================
         bull_near_ma20 = (
             (l <= ma20 <= h)
             or (abs(l - ma20) <= 0.25 * bar_range)
             or (abs(c - ma20) <= 0.35 * bar_range)
         )
-
         bear_near_ma20 = (
             (l <= ma20 <= h)
             or (abs(h - ma20) <= 0.25 * bar_range)
@@ -1851,284 +2614,206 @@ class TradingContext:
         )
 
         # =========================================================
-        # 6) 趋势语境：Law2 更贴近 Velez 的核心
-        #    Bull: 上升趋势中的 3~5 红后第一根绿柱
-        #    Bear: 下降趋势中的 3~5 绿后第一根红柱
+        # 7) 多头判定
         # =========================================================
-        bull_trend_ok = (
-            ma200 is not None
-            and ma20 > ma200
-            and getattr(self, "is_ma20_turning_up", False)
-        )
+        if is_green and 3 <= self.last_red_count <= 5 and self.green_bar_count == 1:
+            # ✅ 新增：失败诊断日志
+            if not (bull_trend_ok and bull_reversal_quality_ok and bull_near_ma20):
+                self.sys_log(
+                    f"🔍 [Law2L 失败诊断] trend={bull_trend_ok}|quality={bull_reversal_quality_ok}|near20={bull_near_ma20}",
+                    level="DEBUG",
+                )
 
-        bear_trend_ok = (
-            ma200 is not None
-            and ma20 < ma200
-            and getattr(self, "is_ma20_turning_down", False)
-        )
+            if bull_trend_ok and bull_reversal_quality_ok and bull_near_ma20:
+                self.ready_to_long_law2 = True
+                self.law2_sl = l
+                self.law2_reversal_high = h
+                self.law2_reversal_low = l
+                # 触发设为反色柱高点，等待下一根突破
+                self.law2_trigger_high = h
+                self.law2_trigger_low = l
+                self.law2_entry_type = "Breakout"
 
-        # =========================================================
-        # 7) 多头判定：3~5 红后第一根绿柱
-        # =========================================================
-        if is_green:
-            if 3 <= self.last_red_count <= 5 and self.green_bar_count == 1:
-                if bull_reversal_quality_ok and bull_trend_ok and bull_near_ma20:
-                    self.ready_to_long_law2 = True
-
-                    # Law2 结构止损：反色柱低点
-                    self.law2_sl = l
-
-                    # 记录关键价位，供 plan_trade 使用
-                    self.law2_reversal_high = h
-                    self.law2_reversal_low = l
-                    self.law2_trigger_high = self.law2_reversal_high
-                    self.law2_trigger_low = self.law2_reversal_low
-                    self.law2_entry_type = "Breakout"
-                    self.sys_log(
-                        f"🌈 [Law#2-Velez]🟢Bull Color Change"
-                        f"|压抑红柱:{self.last_red_count}根"
-                        f"|实体占比:{body_ratio:.2f}"
-                        f"|near20:{bull_near_ma20}"
-                        f"|trend_ok:{bull_trend_ok}"
-                        f"|SL:{self.law2_sl:.2f}",
-                        level="INFO",
-                    )
-
-            elif self.last_red_count == 2:
-                pass
-                # 可选审计日志：
-                # self.sys_log(
-                #     f"👀 [Law#2观察] 仅2根红柱后的变色，不符合 Velez 3~5 根压抑原则，跳过。",
-                #     level="DEBUG",
-                # )
+                self.sys_log(
+                    f"🌈 [Law#2-Velez]🟢Bull Color Change "
+                    f"|压抑:{self.last_red_count}根 | 斜率:{bull_slope_score:.2f} "
+                    f"|质量:{bull_reversal_quality_ok}|位置:{bull_near_ma20} "
+                    f"|SL:{self.law2_sl:.2f}",
+                    level="INFO",
+                )
 
         # =========================================================
-        # 8) 空头判定：3~5 绿后第一根红柱
+        # 8) 空头判定
         # =========================================================
-        elif is_red:
-            if 3 <= self.last_green_count <= 5 and self.red_bar_count == 1:
-                if bear_reversal_quality_ok and bear_trend_ok and bear_near_ma20:
-                    self.ready_to_short_law2 = True
+        elif is_red and 3 <= self.last_green_count <= 5 and self.red_bar_count == 1:
+            # ✅ 新增：失败诊断日志
+            if not (bear_trend_ok and bear_reversal_quality_ok and bear_near_ma20):
+                self.sys_log(
+                    f"🔍 [Law2S 失败诊断] trend={bear_trend_ok}|quality={bear_reversal_quality_ok}|near20={bear_near_ma20}",
+                    level="DEBUG",
+                )
 
-                    # Law2 结构止损：反色柱高点
-                    self.law2_sl = h
+            if bear_trend_ok and bear_reversal_quality_ok and bear_near_ma20:
+                self.ready_to_short_law2 = True
+                self.law2_sl = h
+                self.law2_reversal_high = h
+                self.law2_reversal_low = l
+                self.law2_trigger_high = h
+                self.law2_trigger_low = l
+                self.law2_entry_type = "Breakout"
 
-                    # 记录关键价位，供 plan_trade 使用
-                    self.law2_reversal_high = h
-                    self.law2_reversal_low = l
-                    self.law2_trigger_high = self.law2_reversal_high
-                    self.law2_trigger_low = self.law2_reversal_low
-                    self.law2_entry_type = "Breakout"
-                    self.sys_log(
-                        f"🌈 [Law#2-Velez]🔴Bear Color Change"
-                        f"|压抑绿柱:{self.last_green_count}根"
-                        f"|实体占比:{body_ratio:.2f}"
-                        f"|near20:{bear_near_ma20}"
-                        f"|trend_ok:{bear_trend_ok}"
-                        f"|SL:{self.law2_sl:.2f}",
-                        level="INFO",
-                    )
-
-            elif self.last_green_count == 2:
-                pass
-                # 可选审计日志：
-                # self.sys_log(
-                #     f"👀 [Law#2观察] 仅2根绿柱后的变色，不符合 Velez 3~5 根压抑原则，跳过。",
-                #     level="DEBUG",
-                # )
+                self.sys_log(
+                    f"🌈 [Law#2-Velez]🔴Bear Color Change "
+                    f"|压抑:{self.last_green_count}根 | 斜率:{bear_slope_score:.2f} "
+                    f"|质量:{bear_reversal_quality_ok}|位置:{bear_near_ma20} "
+                    f"|SL:{self.law2_sl:.2f}",
+                    level="INFO",
+                )
 
     def _detect_law3(self, new_bar):
         """
-        [Law #3] 3-5 Bars (Velez Orthodox Version)
-        职责：
-            识别在明确趋势中，价格对 20MA 进行 3~5 根 bars 的正常回调/反弹后，
-            第一根恢复趋势控制权的反色 K 线。
-
-        设计原则：
-        1. 保留 Velez 核心：3~5 根同色回调/反弹 + 第一根反色柱
-        2. 补上大趋势语境：顺 MA20 / MA200 大方向
-        3. 将“靠近 20MA”从 ATR 距离改成 bar 自身几何关系
-        4. 保留“越前高/前低”作为工程化触发器
-        5. 保留 low_of_dip / high_of_bounce 作为结构止损
+        [Law #3] 3-5 Bars (终极融合版)
+        适配新的 Cache 结构和斜率返回值
         """
-
-        # =========================================================
-        # 1) 初始化标志位，防止旧状态污染
-        # =========================================================
         self.ready_to_long_law3 = False
         self.ready_to_short_law3 = False
-
-        # 建议一并清空 Law3 关键字段，避免旧值残留
         self.law3_sl = None
         self.law3_trigger_high = None
         self.law3_trigger_low = None
         self.law3_entry_type = None
 
-        # =========================================================
-        # 2) 物理审计：确保基础数据已就绪
-        # =========================================================
+        # --- 基础审计 ---
         if self.ma20 is None:
             return
-        if not hasattr(self, "ma200"):
-            return
-        if not hasattr(self, "is_ma20_turning_up") or not hasattr(
-            self, "is_ma20_turning_down"
-        ):
-            return
-        if self.history_2min_bars is None or len(self.history_2min_bars) < 2:
+        if self.history_2min_bars is None or len(self.history_2min_bars) < 20:
             return
 
         prev_bar = self.history_2min_bars.iloc[-2]
-
-        # =========================================================
-        # 3) 当前 bar 基础数值
-        # =========================================================
-        o = float(new_bar["open"])
-        h = float(new_bar["high"])
-        l = float(new_bar["low"])
-        c = float(new_bar["close"])
-
-        prev_h = float(prev_bar["high"])
-        prev_l = float(prev_bar["low"])
+        o, h, l, c = (
+            float(new_bar["open"]),
+            float(new_bar["high"]),
+            float(new_bar["low"]),
+            float(new_bar["close"]),
+        )
+        prev_h, prev_l = float(prev_bar["high"]), float(prev_bar["low"])
 
         is_green = c > o
         is_red = c < o
-
         bar_range = h - l
         body_size = abs(c - o)
-
-        if bar_range <= 0 or body_size <= 0:
-            return
-
+        body_ratio = body_size / bar_range if bar_range > 0 else 0.0
         upper_wick = h - max(o, c)
         lower_wick = min(o, c) - l
-        body_ratio = body_size / bar_range if bar_range > 0 else 0.0
 
         ma20 = float(self.ma20)
         ma200 = float(self.ma200) if self.ma200 is not None else None
 
-        # =========================================================
-        # 4) 大趋势语境：更贴近 Velez 原教旨
-        # =========================================================
-        bull_trend_ok = (
-            ma200 is not None
-            and ma20 > ma200
-            and getattr(self, "is_ma20_turning_up", False)
-        )
+        # ✅【核心修复】大趋势语境 (与 GPT 版本对齐)
+        # 原 QWEN 版本：if ma200 is not None: bull_trend_macro = ma20 > ma200 (太严)
+        # 新逻辑：Law3 专用 - 更宽松，只要求小周期（2min）有明确方向即可
+        bull_trend_macro = self.is_ma20_turning_up
+        bear_trend_macro = self.is_ma20_turning_down
 
-        bear_trend_ok = (
-            ma200 is not None
-            and ma20 < ma200
-            and getattr(self, "is_ma20_turning_down", False)
-        )
+        # 2) 趋势斜率语境
+        if 3 <= self.last_red_count <= 5:
+            bull_slope_ok, bull_slope_score, _ = self._check_ma20_slope(
+                self.last_red_count, "long"
+            )
+        else:
+            bull_slope_ok, bull_slope_score = False, 0.0
 
-        # =========================================================
-        # 5) 位置语境：当前 bar 是否发生在 20MA 附近
-        #    不再使用 ATR 距离，改用当前 bar 自身几何关系
-        # =========================================================
-        bull_near_ma20 = (
-            (l <= ma20 <= h)
-            or (abs(l - ma20) <= 0.25 * bar_range)
-            or (abs(c - ma20) <= 0.35 * bar_range)
-        )
+        if 3 <= self.last_green_count <= 5:
+            bear_slope_ok, bear_slope_score, _ = self._check_ma20_slope(
+                self.last_green_count, "short"
+            )
+        else:
+            bear_slope_ok, bear_slope_score = False, 0.0
 
-        bear_near_ma20 = (
-            (l <= ma20 <= h)
-            or (abs(h - ma20) <= 0.25 * bar_range)
-            or (abs(c - ma20) <= 0.35 * bar_range)
-        )
+        # 3) 位置语境
+        bull_near_ma20 = (l <= ma20 <= h) or (abs(l - ma20) <= 0.25 * bar_range)
+        bear_near_ma20 = (l <= ma20 <= h) or (abs(h - ma20) <= 0.25 * bar_range)
 
-        # =========================================================
-        # 6) 反色柱自身质量审计
-        #    Law3 不需要像 Law1 那么强，但至少要避免很差的反色柱
-        # =========================================================
+        # 4) 反色柱质量
         bull_reversal_quality_ok = body_ratio >= 0.50 and upper_wick <= 0.50 * body_size
-
         bear_reversal_quality_ok = body_ratio >= 0.50 and lower_wick <= 0.50 * body_size
 
-        # =========================================================
-        # 7) Bull Law3：3~5 红后第一根绿柱
-        # =========================================================
+        # 5) Bull Law3 触发
         if is_green and self.green_bar_count == 1 and 3 <= self.last_red_count <= 5:
-            # 工程触发器：当前 bar 恢复趋势控制权，越过前一根高点
             bull_trigger_ok = h > prev_h
+            pullback_orderly = self._check_pullback_orderly(self.last_red_count, "red")
+            no_elephant = not self._check_elephant_in_sequence(
+                self.last_red_count, "red"
+            )
 
             if (
-                bull_reversal_quality_ok
-                and bull_trend_ok
+                bull_trend_macro
+                and bull_slope_ok  # ✅ 必须满足斜率 + 单调性
                 and bull_near_ma20
                 and bull_trigger_ok
+                and bull_reversal_quality_ok
+                and pullback_orderly
+                and no_elephant
             ):
                 self.ready_to_long_law3 = True
-
-                # Law3 结构止损：使用回调波段最低点
                 self.law3_sl = self.low_of_dip
                 self.law3_trigger_high = h
                 self.law3_trigger_low = l
                 self.law3_entry_type = "Breakout"
 
                 self.sys_log(
-                    f"🎯 [Law#3-Velez] 🟢Bull Pullback"
-                    f"|确认回调:{self.last_red_count}根红柱"
-                    f"|实体占比:{body_ratio:.2f}"
-                    f"|near20:{bull_near_ma20}"
-                    f"|trend_ok:{bull_trend_ok}"
-                    f"|trigger:{bull_trigger_ok}"
-                    f"|当前高点:{h:.3f}>{prev_h:.3f}"
+                    f"🎯 [Law3L-Ultimate] 🟢Bull Pullback "
+                    f"|回调:{self.last_red_count}根 "
+                    f"|斜率强度:{bull_slope_score:.2f} "
+                    f"|有序:{pullback_orderly}|无大象:{no_elephant} "
                     f"|SL:{self.law3_sl:.2f}",
                     level="INFO",
                 )
 
-        # =========================================================
-        # 8) Bear Law3：3~5 绿后第一根红柱
-        # =========================================================
+        # 6) Bear Law3 触发
         elif is_red and self.red_bar_count == 1 and 3 <= self.last_green_count <= 5:
-            # 工程触发器：当前 bar 恢复空头控制权，跌破前一根低点
             bear_trigger_ok = l < prev_l
+            bounce_orderly = self._check_pullback_orderly(
+                self.last_green_count, "green"
+            )
+            no_elephant = not self._check_elephant_in_sequence(
+                self.last_green_count, "green"
+            )
 
             if (
-                bear_reversal_quality_ok
-                and bear_trend_ok
+                bear_trend_macro
+                and bear_slope_ok  # ✅ 必须满足斜率 + 单调性
                 and bear_near_ma20
                 and bear_trigger_ok
+                and bear_reversal_quality_ok
+                and bounce_orderly
+                and no_elephant
             ):
                 self.ready_to_short_law3 = True
-
-                # Law3 结构止损：使用反弹波段最高点
                 self.law3_sl = self.high_of_bounce
-                self.law3_trigger_high = h
                 self.law3_trigger_low = l
+                self.law3_trigger_high = h
                 self.law3_entry_type = "Breakout"
+
                 self.sys_log(
-                    f"🎯 [Law#3-Velez] 🔴Bear Rally"
-                    f"|确认反弹:{self.last_green_count}根绿柱"
-                    f"|实体占比:{body_ratio:.2f}"
-                    f"|near20:{bear_near_ma20}"
-                    f"|trend_ok:{bear_trend_ok}"
-                    f"|trigger:{bear_trigger_ok}"
-                    f"|当前低点:{l:.3f}<{prev_l:.3f}"
+                    f"🎯 [Law3S-Ultimate] 🔴Bear Rally "
+                    f"|反弹:{self.last_green_count}根 "
+                    f"|斜率强度:{bear_slope_score:.2f} "
+                    f"|有序:{bounce_orderly}|无大象:{no_elephant} "
                     f"|SL:{self.law3_sl:.2f}",
                     level="INFO",
                 )
 
     def _detect_law4(self, new_bar):
         """
-        [Law #4] RBI / GBI (Velez Orthodox Version)
+        [Law #4] RBI / GBI (优化版 - 与 Law3 趋势算法统一)
 
-        职责：
-            在明确趋势中，识别 1~2 根很浅的反向 bars 被主趋势“忽略”后，
-            第一根恢复趋势控制权的延续信号。
-
-        设计原则：
-        1. 保留 RBI / GBI 原始骨架：1~2 根反向柱 + 第一根恢复趋势方向的 bar
-        2. 补上大趋势语境：顺 MA20 / MA200 大方向
-        3. 增加“ignored bars 很浅”的质量审计
-        4. 保留“越前高 / 前低”作为工程化触发器
-        5. 保留 low_of_dip / high_of_bounce 作为结构止损
+        优化点：
+        1. 背景趋势采用 Law3 同款 _check_ma20_slope 算法
+        2. 触发价格优化为 ignored bars 的极值 (改善盈亏比)
         """
 
         # =========================================================
-        # 1) 初始化标志位，防止旧状态污染
+        # 1) 初始化标志位
         # =========================================================
         self.ready_to_long_law4 = False
         self.ready_to_short_law4 = False
@@ -2140,17 +2825,9 @@ class TradingContext:
         # =========================================================
         # 2) 物理审计
         # =========================================================
-        if self.ma20 is None:
+        if self.ma20 is None or not hasattr(self, "ma200"):
             return
-        if not hasattr(self, "ma200"):
-            return
-        if not hasattr(self, "is_ma20_turning_up") or not hasattr(
-            self, "is_ma20_turning_down"
-        ):
-            return
-        if not hasattr(self, "history_2min_bars") or self.history_2min_bars is None:
-            return
-        if len(self.history_2min_bars) < 2:
+        if self.history_2min_bars is None or len(self.history_2min_bars) < 3:
             return
 
         prev_bar = self.history_2min_bars.iloc[-2]
@@ -2179,31 +2856,28 @@ class TradingContext:
         if bar_range <= 0 or body_size <= 0:
             return
 
-        ma8 = float(self.ma8) if getattr(self, "ma8", None) is not None else None
         ma20 = float(self.ma20)
         ma200 = float(self.ma200) if self.ma200 is not None else None
 
         # =========================================================
-        # 4) 大趋势语境：比原版更贴近 Velez
+        # 4) 大趋势语境 (✅ 采用与 Law3 统一的 _check_ma20_slope 算法)
         # =========================================================
-        bull_trend_ok = (
-            ma200 is not None
-            and ma20 > ma200
-            and getattr(self, "is_ma20_turning_up", False)
+        # 检查 ignored bars 之前的趋势质量
+        bull_slope_ok, bull_slope_score, bull_mono = self._check_ma20_slope(
+            self.last_red_count, "long"
+        )
+        bear_slope_ok, bear_slope_score, bear_mono = self._check_ma20_slope(
+            self.last_green_count, "short"
         )
 
-        bear_trend_ok = (
-            ma200 is not None
-            and ma20 < ma200
-            and getattr(self, "is_ma20_turning_down", False)
-        )
+        # 必须满足：MA200 方向 + 斜率质量
+        bull_trend_ok = ma200 is not None and ma20 > ma200 and bull_slope_ok
+
+        bear_trend_ok = ma200 is not None and ma20 < ma200 and bear_slope_ok
 
         # =========================================================
-        # 5) “ignored bars 很浅”的质量审计
-        #    关键思想：1~2 根反向柱必须只是 pause，不应深度破坏趋势
+        # 5) "ignored bars 很浅”的质量审计
         # =========================================================
-
-        # 5.1 当前前一根 bar 的基本质量（因为最终 trigger 是针对 prev_bar）
         prev_bar_range = prev_h - prev_l
         prev_body_size = abs(prev_c - prev_o)
 
@@ -2212,23 +2886,18 @@ class TradingContext:
 
         prev_body_ratio = prev_body_size / prev_bar_range if prev_bar_range > 0 else 0.0
 
-        # 5.2 Bull RBI:
-        #     左侧那 1~2 根红柱应该是很浅的小回撤，不应明显跌穿 20MA 太多
+        # 5.2 Bull RBI
         bull_ignored_shallow_ok = (
             self.low_of_dip > 0
             and (
-                # 回撤低点不要明显深破 20MA
                 (self.low_of_dip >= ma20 - 0.35 * prev_bar_range)
-                # 或者前一根反向柱本身仍然围绕 20MA 附近
                 or (prev_l <= ma20 <= prev_h)
                 or (abs(prev_l - ma20) <= 0.30 * prev_bar_range)
             )
-            # 反向柱自身不要太“重”
             and prev_body_ratio <= 0.65
         )
 
-        # 5.3 Bear GBI:
-        #     左侧那 1~2 根绿柱应该是很浅的小反弹，不应明显突破 20MA 太多
+        # 5.3 Bear GBI
         bear_ignored_shallow_ok = (
             self.high_of_bounce > 0
             and (
@@ -2241,14 +2910,12 @@ class TradingContext:
 
         # =========================================================
         # 6) 当前恢复趋势方向 bar 的基本质量
-        #    Law4 不需要像 Law1 那样苛刻，但至少当前恢复 bar 不能太弱
         # =========================================================
         upper_wick = h - max(o, c)
         lower_wick = min(o, c) - l
         body_ratio = body_size / bar_range if bar_range > 0 else 0.0
 
         bull_reclaim_quality_ok = body_ratio >= 0.45 and upper_wick <= 0.60 * body_size
-
         bear_reclaim_quality_ok = body_ratio >= 0.45 and lower_wick <= 0.60 * body_size
 
         # =========================================================
@@ -2260,7 +2927,7 @@ class TradingContext:
             and 1 <= self.last_red_count <= 2
             and self.green_bar_count == 1
         ):
-            # 工程触发器：当前恢复 bar 突破前一根反向 bar 的高点
+            # 计算 ignored bars 的高点
             ignored_red_bars = self.history_2min_bars.iloc[
                 -(self.last_red_count + 1) : -1
             ]
@@ -2269,22 +2936,20 @@ class TradingContext:
                 if not ignored_red_bars.empty
                 else prev_h
             )
+
+            # 确认条件：当前 Reclaim Bar 必须突破 ignored bars 高点
             bull_trigger_ok = h > ignored_red_high
 
-            # 保留你原版短周期过滤思想，但降级为辅助，不作为唯一趋势定义
-            bull_short_term_ok = ma8 is not None and c > ma8 and ma8 > ma20
-
-            if (
-                bull_trigger_ok
-                and bull_ignored_shallow_ok
-                and bull_reclaim_quality_ok
-                and bull_short_term_ok
-            ):
+            if bull_trigger_ok and bull_ignored_shallow_ok and bull_reclaim_quality_ok:
                 self.ready_to_long_law4 = True
                 self.law4_sl = self.low_of_dip
-                self.law4_trigger_high = h
+
+                # ✅ 优化：触发价设为 ignored bars 高点，而不是当前 h
+                # 这样如果当前 h 已经突破很多，下一根挂单可以在更低位置成交，盈亏比更好
+                self.law4_trigger_high = ignored_red_high
                 self.law4_trigger_low = l
                 self.law4_entry_type = "Breakout"
+
                 trend_type = (
                     "SuperTrend"
                     if getattr(self, "is_super_uptrend", False)
@@ -2292,13 +2957,14 @@ class TradingContext:
                 )
 
                 self.sys_log(
-                    f"⚡ [Law#4-Velez-RBI] 🟢 Red Bar Ignored"
-                    f"|趋势:{trend_type}"
+                    f"⚡ [Law4L-Velez-RBI] 🟢 Red Bar Ignored"
+                    f"|趋势:{trend_type}|slope:{bull_slope_score:.2f}"
                     f"|压抑:{self.last_red_count}根红柱"
+                    f"|trend_ok:{bull_trend_ok}"
                     f"|ignored_ok:{bull_ignored_shallow_ok}"
                     f"|reclaim_ok:{bull_reclaim_quality_ok}"
-                    f"|trigger:{bull_trigger_ok}"
                     f"|突破:{h:.3f}>{ignored_red_high:.3f}"
+                    f"|Trigger:{self.law4_trigger_high:.2f}"
                     f"|SL:{self.law4_sl:.2f}",
                     level="INFO",
                 )
@@ -2312,7 +2978,7 @@ class TradingContext:
             and 1 <= self.last_green_count <= 2
             and self.red_bar_count == 1
         ):
-            # 工程触发器：当前恢复 bar 跌破前一根反向 bar 的低点
+            # 计算 ignored bars 的低点
             ignored_green_bars = self.history_2min_bars.iloc[
                 -(self.last_green_count + 1) : -1
             ]
@@ -2321,21 +2987,17 @@ class TradingContext:
                 if not ignored_green_bars.empty
                 else prev_l
             )
+
+            # 确认条件：当前 Reclaim Bar 必须跌破 ignored bars 低点
             bear_trigger_ok = l < ignored_green_low
 
-            # 保留你原版短周期过滤思想，但降级为辅助
-            bear_short_term_ok = ma8 is not None and c < ma8 and ma8 < ma20
-
-            if (
-                bear_trigger_ok
-                and bear_ignored_shallow_ok
-                and bear_reclaim_quality_ok
-                and bear_short_term_ok
-            ):
+            if bear_trigger_ok and bear_ignored_shallow_ok and bear_reclaim_quality_ok:
                 self.ready_to_short_law4 = True
                 self.law4_sl = self.high_of_bounce
+
+                # ✅ 优化：触发价设为 ignored bars 低点
                 self.law4_trigger_high = h
-                self.law4_trigger_low = l
+                self.law4_trigger_low = ignored_green_low
                 self.law4_entry_type = "Breakout"
 
                 trend_type = (
@@ -2345,34 +3007,31 @@ class TradingContext:
                 )
 
                 self.sys_log(
-                    f"⚡ [Law#4-Velez-GBI] 🔴 Green Bar Ignored"
-                    f"|趋势:{trend_type}"
+                    f"⚡ [Law4S-Velez-GBI] 🔴 Green Bar Ignored"
+                    f"|趋势:{trend_type}|slope:{bear_slope_score:.2f}"
                     f"|压抑:{self.last_green_count}根绿柱"
+                    f"|trend_ok:{bear_trend_ok}"
                     f"|ignored_ok:{bear_ignored_shallow_ok}"
                     f"|reclaim_ok:{bear_reclaim_quality_ok}"
-                    f"|trigger:{bear_trigger_ok}"
                     f"|跌破:{l:.3f}<{ignored_green_low:.3f}"
+                    f"|Trigger:{self.law4_trigger_low:.2f}"
                     f"|SL:{self.law4_sl:.2f}",
                     level="INFO",
                 )
 
     def _detect_law5(self, new_bar):
         """
-        [Law #5] 20MA Cross (Velez Orthodox Version)
+        [Law #5] 20MA Reclaim/Loss (Velez Orthodox Fused Version)
 
-        职责：
-            识别在明确趋势语境中，价格重新夺回/失守 20MA 的有效穿越信号。
-
-        设计原则：
-        1. 保留 Law5 核心：价格从 20MA 一侧物理穿越到另一侧
-        2. 补上大趋势语境：顺 MA20 / MA200 大方向
-        3. 保留 ATR 噪音过滤，但不再单靠 ATR
-        4. 加入当前穿越柱自身质量审计（实体占比 + wick 质量）
-        5. 保留 Elephant Power Cross 作为强度标签
+        融合设计：
+        1. 时序安全：强制 Bar-Close 确认，杜绝盘中信号漂移
+        2. 趋势语境：MA20/200 发散 + 斜率陡峭（剔除 GPT 的 Narrow 震荡假设）
+        3. 结构验证：Pullback → Test → Reclaim 历史语境检查
+        4. K线质量：引入 close_pos 归一化 + reclaim_buffer 防抖（吸收 GPT 工程优势）
+        5. 参数化：关键阈值通过 getattr 动态加载，便于回测网格优化
         """
-
         # =========================================================
-        # 1) 初始化标志位，防止旧状态污染
+        # 0) 状态重置（防跨Bar污染）
         # =========================================================
         self.ready_to_long_law5 = False
         self.ready_to_short_law5 = False
@@ -2382,168 +3041,201 @@ class TradingContext:
         self.law5_entry_type = None
 
         # =========================================================
-        # 2) 物理审计
+        # 1) 时序安全与基础依赖校验
         # =========================================================
-        if not hasattr(self, "effective_atr"):
+        # 🔒 核心防重绘：仅对已闭合Bar计算。若实盘/回测非Bar-Close事件触发，直接返回
+        if not getattr(new_bar, "is_closed", True):
             return
-        if self.ma20 is None:
-            return
-        if self.ma20_prev is None:
-            return
-        if not hasattr(self, "ma200"):
-            return
-        if not hasattr(self, "is_ma20_turning_up") or not hasattr(
-            self, "is_ma20_turning_down"
+
+        if (
+            not hasattr(self, "effective_atr")
+            or self.effective_atr is None
+            or self.effective_atr <= 0
         ):
             return
-        if len(self.history_2min_bars) < 2:
+        if self.ma20 is None or self.ma20_prev is None:
+            return
+        if not hasattr(self, "ma200") or self.ma200 is None:
+            return
+        # 需足够历史柱验证 Pullback 结构
+        if len(self.history_2min_bars) < 6:
             return
 
         # =========================================================
-        # 3) 基础数据提取
+        # 2) K线物理审计（结构化提取）
         # =========================================================
-        prev_close = float(self.history_2min_bars["close"].iloc[-2])
-
         o = float(new_bar["open"])
         h = float(new_bar["high"])
         l = float(new_bar["low"])
         c = float(new_bar["close"])
 
-        curr_close = c
-        body_size = abs(c - o)
-        bar_range = h - l
-
-        if bar_range <= 0 or body_size <= 0:
-            return
+        rng = h - l
+        body = abs(c - o)
+        if rng <= 0 or body <= 0:
+            return  # 十字星/Doji 无动能，跳过
 
         upper_wick = h - max(o, c)
         lower_wick = min(o, c) - l
-        body_ratio = body_size / bar_range if bar_range > 0 else 0.0
+        body_ratio = body / rng
+        close_pos = (c - l) / rng  # 0~1，越接近1收盘越贴近高点
 
+        # 动态门槛（可外部配置）
+        atr = float(self.effective_atr)
+        reclaim_buffer = atr * getattr(self, "law5_reclaim_buffer_atr", 0.08)
+        body_atr_min = atr * getattr(self, "law5_body_atr_min", 0.40)
+        body_ratio_min = getattr(self, "law5_body_ratio_min", 0.55)
+        close_pos_min = getattr(self, "law5_close_pos_min", 0.65)
+        close_pos_max = getattr(self, "law5_close_pos_max", 0.35)
+        wick_body_max = getattr(self, "law5_wick_body_max", 0.45)
+
+        # =========================================================
+        # 3) 大趋势语境审计（Velez 原教旨：发散+倾斜，非收敛）
+        # =========================================================
         ma20 = float(self.ma20)
         ma20_prev = float(self.ma20_prev)
-        ma200 = float(self.ma200) if self.ma200 is not None else None
+        ma200 = float(self.ma200)
 
-        # =========================================================
-        # 4) 门槛定义
-        # =========================================================
-        noise_threshold = self.effective_atr * 0.5
-        elephant_threshold = self.effective_atr * 2.0
+        ma20_slope = ma20 - ma20_prev
 
-        # =========================================================
-        # 5) 大趋势语境（更贴近 Velez）
-        # =========================================================
+        min_slope = atr * getattr(self, "law5_min_slope_atr_mult", 0.35)  # 0.25 → 0.35
+
+        ma200_sep = abs(ma20 - ma200)
+
+        min_sep = atr * getattr(self, "law5_min_sep_atr_mult", 3.5)  # 2.5 → 3.5
+        # 方向+斜率+间距 三重过滤
         bull_trend_ok = (
-            ma200 is not None
-            and ma20 > ma200
-            and getattr(self, "is_ma20_turning_up", False)
+            (ma20 > ma200) and (ma20_slope > min_slope) and (ma200_sep > min_sep)
         )
-
         bear_trend_ok = (
-            ma200 is not None
-            and ma20 < ma200
-            and getattr(self, "is_ma20_turning_down", False)
+            (ma20 < ma200) and (ma20_slope < -min_slope) and (ma200_sep > min_sep)
+        )
+
+        # 若不满足趋势语境，直接过滤（Law5 绝不在黏合/走平市交易）
+        if not (bull_trend_ok or bear_trend_ok):
+            return
+
+        ma200_ratio = abs(ma20 - ma200) / ma200
+        if ma200_ratio < 0.015:  # MA20与MA200距离<1.5%，判定为黏合震荡
+            return  # 跳过Law5探测
+
+        # =========================================================
+        # 4) 回调-夺回结构验证 (Pullback -> Test -> Reclaim)
+        # =========================================================
+
+        if len(self.history_2min_bars) < 2:
+            return  # 防御性保护
+        prev_close = float(
+            self.history_2min_bars["close"].iloc[-2]
+        )  # T-1 收盘（因 new_bar 已 append，-1 是 T，-2 才是 T-1）
+
+        lookback = 5
+        hist_closes = (
+            self.history_2min_bars["close"]
+            .iloc[-(lookback + 1) : -1]
+            .values.astype(float)
+        )
+
+        # 结构要件1：T-1 已回踩至 MA20 附近（测试支撑/压力）
+        tested_ma = abs(prev_close - ma20_prev) <= atr * 1.5
+
+        # 结构要件2：回踩前，价格曾在趋势侧运行（确认是趋势中的回调，而非震荡）
+        if bull_trend_ok:
+            above_count = sum(1 for cl in hist_closes if cl > ma20_prev)
+            structure_ok = tested_ma and (above_count >= 3)
+        elif bear_trend_ok:
+            below_count = sum(1 for cl in hist_closes if cl < ma20_prev)
+            structure_ok = tested_ma and (below_count >= 3)
+        else:
+            structure_ok = False
+
+        if not structure_ok:
+            return  # 缺乏“先趋势-后回踩”语境，非 Velez Law5
+
+        # =========================================================
+        # 5) 核心信号判定：物理穿越 + K线质量 + 防抖
+        # =========================================================
+        # 物理穿越：前收盘在MA侧/贴线，当前收盘明确突破（含 buffer 防毛刺）
+        bull_cross = (prev_close <= ma20_prev + reclaim_buffer) and (
+            c > ma20 + reclaim_buffer
+        )
+        bear_cross = (prev_close >= ma20_prev - reclaim_buffer) and (
+            c < ma20 - reclaim_buffer
+        )
+
+        # K线质量审计
+        bull_quality = (
+            body >= body_atr_min
+            and body_ratio >= body_ratio_min
+            and close_pos >= close_pos_min
+            and upper_wick <= body * wick_body_max
+        )
+        bear_quality = (
+            body >= body_atr_min
+            and body_ratio >= body_ratio_min
+            and close_pos <= close_pos_max
+            and lower_wick <= body * wick_body_max
         )
 
         # =========================================================
-        # 6) 当前穿越柱自身质量审计
-        #    Bull：上影线不能太重
-        #    Bear：下影线不能太重
+        # 6) 状态触发与日志记录
         # =========================================================
-        bull_cross_quality_ok = (
-            body_size > noise_threshold
-            and body_ratio >= 0.50
-            and upper_wick <= 0.50 * body_size
-        )
+        elephant_thresh = atr * getattr(self, "law5_elephant_atr_mult", 1.8)
 
-        bear_cross_quality_ok = (
-            body_size > noise_threshold
-            and body_ratio >= 0.50
-            and lower_wick <= 0.50 * body_size
-        )
-
-        # =========================================================
-        # 7) 核心判定逻辑
-        # =========================================================
-
-        # ---------------------------------------------------------
-        # 7.1 多头穿越 (Bull Cross)
-        # 物理定义：前收盘在 MA20 下方/等于，当前收盘站上 MA20
-        # ---------------------------------------------------------
-        bull_cross_ok = (prev_close <= ma20_prev) and (curr_close > ma20)
-
-        if bull_cross_ok and bull_trend_ok and bull_cross_quality_ok:
+        if bull_cross and bull_quality:
             self.ready_to_long_law5 = True
-            self.law5_sl = l  # 固化穿越柱低点
+            # self.law5_sl = l
+            self.law5_sl = l - 0.2 * atr
             self.law5_trigger_high = h
             self.law5_trigger_low = l
             self.law5_entry_type = "Breakout"
-            if body_size >= elephant_threshold:
-                tag = "🔥 [Law#5-Velez] 🟢 Elephant Power 20MA Cross!"
-            else:
-                tag = "🎯 [Law#5-Velez] 🟢 Standard 20MA Cross"
 
+            is_elephant = body >= elephant_thresh
+            tag = (
+                "🔥 [Law5L-Velez] 🟢 Elephant Reclaim"
+                if is_elephant
+                else "🎯 [Law5L-Velez] 🟢 Standard Reclaim"
+            )
             self.sys_log(
-                f"{tag}"
-                f" | 实体:{body_size:.3f}"
-                f" | 实体占比:{body_ratio:.2f}"
-                f" | MA20:{ma20:.3f}"
-                f" | trend_ok:{bull_trend_ok}"
-                f" | 穿越点对账:{prev_close:.3f}->{curr_close:.3f}"
-                f" | SL:{self.law5_sl:.2f}",
+                f"{tag} | 实体:{body:.3f} | 占比:{body_ratio:.2f} | ClosePos:{close_pos:.2f} "
+                f"| MA20:{ma20:.3f} | 斜率:{ma20_slope:.3f} | 距MA200:{ma200_sep/atr:.1f}xATR "
+                f"| 穿越:{prev_close:.3f}->{c:.3f} | SL:{self.law5_sl:.2f}",
                 level="INFO",
             )
 
-        # ---------------------------------------------------------
-        # 7.2 空头穿越 (Bear Cross)
-        # 物理定义：前收盘在 MA20 上方/等于，当前收盘跌回 MA20 下方
-        # ---------------------------------------------------------
-        elif (
-            (prev_close >= ma20_prev)
-            and (curr_close < ma20)
-            and bear_trend_ok
-            and bear_cross_quality_ok
-        ):
+        elif bear_cross and bear_quality:
             self.ready_to_short_law5 = True
-            self.law5_sl = h  # 固化穿越柱高点
+            # self.law5_sl = h
+            self.law5_sl = h + 0.2 * atr
             self.law5_trigger_high = h
             self.law5_trigger_low = l
             self.law5_entry_type = "Breakout"
 
-            if body_size >= elephant_threshold:
-                tag = "🔥 [Law#5-Velez] 🔴 Elephant Power 20MA Cross!"
-            else:
-                tag = "🎯 [Law#5-Velez] 🔴 Standard 20MA Cross"
-
+            is_elephant = body >= elephant_thresh
+            tag = (
+                "🔥 [Law5S-Velez] 🔴 Elephant Loss"
+                if is_elephant
+                else "🎯 [Law5S-Velez] 🔴 Standard Loss"
+            )
             self.sys_log(
-                f"{tag}"
-                f" | 实体:{body_size:.3f}"
-                f" | 实体占比:{body_ratio:.2f}"
-                f" | MA20:{ma20:.3f}"
-                f" | trend_ok:{bear_trend_ok}"
-                f" | 穿越点对账:{prev_close:.3f}->{curr_close:.3f}"
-                f" | SL:{self.law5_sl:.2f}",
+                f"{tag} | 实体:{body:.3f} | 占比:{body_ratio:.2f} | ClosePos:{close_pos:.2f} "
+                f"| MA20:{ma20:.3f} | 斜率:{ma20_slope:.3f} | 距MA200:{ma200_sep/atr:.1f}xATR "
+                f"| 穿越:{prev_close:.3f}->{c:.3f} | SL:{self.law5_sl:.2f}",
                 level="INFO",
             )
 
     def _detect_law6(self, new_bar):
         """
-        [Law #6] Home Run (Velez Orthodox Version)
+        [Law #6] Home Run (Velez Orthodox Fused Version)
 
-        职责：
-            识别在明确趋势中，价格回踩/反弹到 20MA 一带后，
-            形成 BT / TT（Bottoming Tail / Topping Tail）的强烈拒绝信号。
-
-        设计原则：
-        1. 优先复用 _detect_tail_bars() 的形态识别结果（BT / TT）
-        2. 补上大趋势语境：顺 MA20 / MA200 大方向
-        3. 保留 “穿透 20MA + 收回另一侧” 的核心逻辑
-        4. 用“收盘位置质量”替代“实体 > 0.5 ATR”硬门槛
-        5. 保留 tail bar 极端点作为结构止损
+        融合设计：
+        1. 时序安全：强制 Bar-Close 确认，杜绝盘中 BT/TT 形态漂移
+        2. 趋势语境：MA20/200 发散 + 斜率陡峭（剔除震荡市假拒绝）
+        3. 结构验证：Trend → Pullback → Test at 20MA → Reject（回踩测试确认）
+        4. 形态质量：复用 Tail 识别 + 收盘位置归一化 + ATR 影线显著性过滤
+        5. 参数化：关键阈值 getattr 动态加载，便于网格调优
         """
-
         # =========================================================
-        # 1) 初始化标志位，防止旧状态污染
+        # 0) 状态重置（防跨Bar污染）
         # =========================================================
         self.ready_to_long_law6 = False
         self.ready_to_short_law6 = False
@@ -2553,142 +3245,140 @@ class TradingContext:
         self.law6_entry_type = None
 
         # =========================================================
-        # 2) 物理审计
+        # 1) 时序安全与基础依赖校验
         # =========================================================
-        if self.ma20 is None:
+        # 🔒 核心防重绘：仅对已闭合Bar计算
+        if not getattr(new_bar, "is_closed", True):
             return
-        if not hasattr(self, "ma200"):
+
+        if self.ma20 is None or self.ma20_prev is None:
             return
-        if not hasattr(self, "is_ma20_turning_up") or not hasattr(
-            self, "is_ma20_turning_down"
+        if not hasattr(self, "ma200") or self.ma200 is None:
+            return
+        if (
+            not hasattr(self, "effective_atr")
+            or self.effective_atr is None
+            or self.effective_atr <= 0
         ):
             return
         if not hasattr(self, "current_tail_type"):
             return
-
-        # =========================================================
-        # 3) 基础形态数据计算
-        # =========================================================
-        high = float(new_bar["high"])
-        low = float(new_bar["low"])
-        open_p = float(new_bar["open"])
-        close = float(new_bar["close"])
-
-        total_range = high - low
-        body_size = abs(close - open_p)
-
-        if total_range <= 0:
+        if len(self.history_2min_bars) < 6:
             return
 
-        upper_tail = high - max(open_p, close)
-        lower_tail = min(open_p, close) - low
+        # =========================================================
+        # 2) K线物理与形态数据提取
+        # =========================================================
+        o = float(new_bar["open"])
+        h = float(new_bar["high"])
+        l = float(new_bar["low"])
+        c = float(new_bar["close"])
 
+        rng = h - l
+        body = abs(c - o)
+        if rng <= 0 or body <= 0:
+            return
+
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+        close_pos = (c - l) / rng  # 0~1，越接近1收盘越贴近高点
+
+        atr = float(self.effective_atr)
         ma20 = float(self.ma20)
-        ma200 = float(self.ma200) if self.ma200 is not None else None
+        ma20_prev = float(self.ma20_prev)
+        ma200 = float(self.ma200)
 
         # =========================================================
-        # 4) 大趋势语境（更贴近 Velez 原教旨）
+        # 3) 大趋势语境审计（Velez 原教旨：发散+倾斜）
         # =========================================================
+        ma20_slope = ma20 - ma20_prev
+        min_slope = atr * getattr(self, "law6_min_slope_atr_mult", 0.25)
+        ma200_sep = abs(ma20 - ma200)
+        min_sep = atr * getattr(self, "law6_min_sep_atr_mult", 2.5)
+
         bull_trend_ok = (
-            ma200 is not None
-            and ma20 > ma200
-            and getattr(self, "is_ma20_turning_up", False)
+            (ma20 > ma200) and (ma20_slope > min_slope) and (ma200_sep > min_sep)
         )
-
         bear_trend_ok = (
-            ma200 is not None
-            and ma20 < ma200
-            and getattr(self, "is_ma20_turning_down", False)
+            (ma20 < ma200) and (ma20_slope < -min_slope) and (ma200_sep > min_sep)
         )
 
-        # =========================================================
-        # 5) 收盘位置质量审计（替代“实体必须 > 0.5 ATR”）
-        #    Bull BT: 收盘必须明显回到 bar 上半区
-        #    Bear TT: 收盘必须明显压到 bar 下半区
-        # =========================================================
-        close_position_from_low = (close - low) / total_range
-        close_position_from_high = (high - close) / total_range
-
-        bull_close_quality_ok = close_position_from_low >= 0.60
-        bear_close_quality_ok = close_position_from_high >= 0.60
+        if not (bull_trend_ok or bear_trend_ok):
+            return
 
         # =========================================================
-        # 6) 核心判定逻辑
+        # 4) 回调-测试结构验证 (Trend → Pullback → Test at MA20)
         # =========================================================
+        lookback = 5
+        hist_closes = (
+            self.history_2min_bars["close"]
+            .iloc[-(lookback + 1) : -1]
+            .values.astype(float)
+        )
 
-        # ---------------------------------------------------------
-        # 6.1 多头判定：Bottoming Tail (BT)
-        # 条件：
-        #   A. _detect_tail_bars 已识别为 BT
-        #   B. Low 必须穿透 20MA
-        #   C. Close 必须收回 20MA 之上
-        #   D. 处于上涨趋势语境中
-        #   E. 收盘位置足够强
-        # ---------------------------------------------------------
-        if self.current_tail_type == "BT":
-            has_penetrated = low < ma20
-            has_recovered = close > ma20
+        # 结构要件：过去多数K线在趋势侧运行，当前K线明确回踩测试MA20
+        tested_ma20 = (
+            (l <= ma20 + atr * 0.15) if bull_trend_ok else (h >= ma20 - atr * 0.15)
+        )
 
-            if (
-                bull_trend_ok
-                and has_penetrated
-                and has_recovered
-                and bull_close_quality_ok
-            ):
-                self.ready_to_long_law6 = True
-                self.law6_sl = low  # 固化长下影尖端
-                self.law6_trigger_high = high
-                self.law6_trigger_low = low
-                self.law6_entry_type = "Breakout"
+        if bull_trend_ok:
+            above_count = sum(1 for cl in hist_closes if cl > ma20_prev)
+            structure_ok = tested_ma20 and (above_count >= 3)
+        elif bear_trend_ok:
+            below_count = sum(1 for cl in hist_closes if cl < ma20_prev)
+            structure_ok = tested_ma20 and (below_count >= 3)
+        else:
+            structure_ok = False
 
-                ratio = lower_tail / max(body_size, 0.001)
+        if not structure_ok:
+            return  # 缺乏趋势回踩语境，仅为震荡市随机影线
 
-                self.sys_log(
-                    f"⚾ [Law#6-Velez] 🟢 Home Run (BT)"
-                    f"|影线比:{ratio:.1f}x"
-                    f"|收盘位置:{close_position_from_low:.2f}"
-                    f"|trend_ok:{bull_trend_ok}"
-                    f"|Low:{low:.3f} < MA20:{ma20:.3f} < Close:{close:.3f}"
-                    f"|SL:{self.law6_sl:.2f}",
-                    level="INFO",
-                )
+        # =========================================================
+        # 5) 核心判定：形态识别 + 穿透收回 + 收盘质量
+        # =========================================================
+        # 收盘质量门槛
+        close_pos_min = getattr(self, "law6_close_pos_min", 0.65)
+        close_pos_max = getattr(self, "law6_close_pos_max", 0.35)
 
-        # ---------------------------------------------------------
-        # 6.2 空头判定：Topping Tail (TT)
-        # 条件：
-        #   A. _detect_tail_bars 已识别为 TT
-        #   B. High 必须穿透 20MA
-        #   C. Close 必须压回 20MA 之下
-        #   D. 处于下跌趋势语境中
-        #   E. 收盘位置足够弱
-        # ---------------------------------------------------------
-        elif self.current_tail_type == "TT":
-            has_penetrated = high > ma20
-            has_rejected = close < ma20
+        bull_tail_ok = (self.current_tail_type == "BT") and (close_pos >= close_pos_min)
+        bear_tail_ok = (self.current_tail_type == "TT") and (close_pos <= close_pos_max)
 
-            if (
-                bear_trend_ok
-                and has_penetrated
-                and has_rejected
-                and bear_close_quality_ok
-            ):
-                self.ready_to_short_law6 = True
-                self.law6_sl = high  # 固化长上影尖端
-                self.law6_trigger_high = high
-                self.law6_trigger_low = low
-                self.law6_entry_type = "Breakout"
+        # 穿透与收回逻辑
+        bull_reject_ok = (l < ma20) and (c > ma20)
+        bear_reject_ok = (h > ma20) and (c < ma20)
 
-                ratio = upper_tail / max(body_size, 0.001)
+        # =========================================================
+        # 6) 状态触发与日志记录
+        # =========================================================
+        if bull_trend_ok and structure_ok and bull_tail_ok and bull_reject_ok:
+            self.ready_to_long_law6 = True
+            self.law6_sl = l - 0.15 * atr  # 留出微小呼吸空间防毛刺
+            self.law6_trigger_high = h
+            self.law6_trigger_low = l
+            self.law6_entry_type = "Breakout"
 
-                self.sys_log(
-                    f"⚾ [Law#6-Velez] 🔴 Home Run (TT)"
-                    f"|影线比:{ratio:.1f}x"
-                    f"|收盘位置:{close_position_from_high:.2f}"
-                    f"|trend_ok:{bear_trend_ok}"
-                    f"|High:{high:.3f} > MA20:{ma20:.3f} > Close:{close:.3f}"
-                    f"|SL:{self.law6_sl:.2f}",
-                    level="INFO",
-                )
+            tail_ratio = lower_wick / max(body, 0.001)
+            self.sys_log(
+                f"⚾ [Law6L-Velez] 🟢 Home Run (BT) | 影线比:{tail_ratio:.1f}x | 收盘位:{close_pos:.2f} "
+                f"| 斜率:{ma20_slope:.3f} | 距MA200:{ma200_sep/atr:.1f}xATR "
+                f"| 结构:回踩测试成功 | Low:{l:.3f} < MA20:{ma20:.3f} < Close:{c:.3f} | SL:{self.law6_sl:.2f}",
+                level="INFO",
+            )
+
+        elif bear_trend_ok and structure_ok and bear_tail_ok and bear_reject_ok:
+            self.ready_to_short_law6 = True
+            self.law6_sl = h + 0.15 * atr
+            self.law6_trigger_high = h
+            self.law6_trigger_low = l
+            self.law6_entry_type = "Breakout"
+
+            tail_ratio = upper_wick / max(body, 0.001)
+            self.sys_log(
+                f"⚾ [Law6S-Velez] 🔴 Home Run (TT) | 影线比:{tail_ratio:.1f}x | 收盘位:{close_pos:.2f} "
+                f"| 斜率:{ma20_slope:.3f} | 距MA200:{ma200_sep/atr:.1f}xATR "
+                f"| 结构:回踩测试成功 | High:{h:.3f} > MA20:{ma20:.3f} > Close:{c:.3f} | SL:{self.law6_sl:.2f}",
+                level="INFO",
+            )
 
     def _detect_law7(self, new_bar):
         """
@@ -2702,21 +3392,17 @@ class TradingContext:
 
     def _detect_law8(self, new_bar):
         """
-        [Law #8] Fab 42 (Velez Orthodox Version)
+        [Law #8] Fab 42 (Velez Orthodox Fused Version)
 
-        职责：
-            识别 15m 大周期趋势方向与 2m 小周期恢复控制权动作之间的共振信号。
-
-        设计原则：
-        1. 保留 Fab42 核心：15m 趋势先行，2m 顺势触发
-        2. 将 2m MA20 状态从日志信息升级为真实判定条件
-        3. 将“第一根变色柱”升级为“第一根恢复控制权的 bar”
-        4. 保留 8MA 偏离过滤，避免追涨杀跌
-        5. 用 bar 自身质量审计替代单纯 ATR 力度门槛
+        融合设计：
+        1. 时序安全：强制 Bar-Close 确认，杜绝盘中信号漂移
+        2. 15m 语境：依赖 is_15m_trending，但增加日志审计与回退保护
+        3. 2m 结构验证：Pullback → Test at MA8/MA20 → Reclaim 历史语境检查
+        4. 空间过滤：MA8 偏离归一化 + 动态 ATR 门槛
+        5. 参数化：关键阈值 getattr 动态加载，便于网格调优
         """
-
         # =========================================================
-        # 1) 初始化标志位，防止旧状态污染
+        # 0) 状态重置（防跨Bar污染）
         # =========================================================
         self.ready_to_long_law8 = False
         self.ready_to_short_law8 = False
@@ -2726,179 +3412,184 @@ class TradingContext:
         self.law8_entry_type = None
 
         # =========================================================
-        # 2) 物理审计
+        # 1) 时序安全与基础依赖校验
         # =========================================================
-        if not hasattr(self, "effective_atr"):
+        if not getattr(new_bar, "is_closed", True):
             return
-        if self.ma20 is None:
-            return
-        if self.ma8 is None:
-            return
-        if not hasattr(self, "ma200"):
-            return
-        if not hasattr(self, "is_ma20_turning_up") or not hasattr(
-            self, "is_ma20_turning_down"
+        if (
+            not hasattr(self, "effective_atr")
+            or self.effective_atr is None
+            or self.effective_atr <= 0
         ):
             return
-        if self.history_2min_bars is None or len(self.history_2min_bars) < 2:
+        if self.ma20 is None or self.ma8 is None:
             return
-
-        prev_bar = self.history_2min_bars.iloc[-2]
-        if not (pd.notna(new_bar["high"]) and pd.notna(prev_bar["high"])):
+        if not hasattr(self, "ma200") or self.ma200 is None:
+            return
+        if len(self.history_2min_bars) < 3:
             return
 
         # =========================================================
-        # 3) 基础数据计算
+        # 2) K线物理与历史数据提取
         # =========================================================
         o = float(new_bar["open"])
         h = float(new_bar["high"])
         l = float(new_bar["low"])
         c = float(new_bar["close"])
 
+        # 注意：process_new_2min_bar 已先将 new_bar 追加至 history，故 -1 为 T，-2 为 T-1
+        prev_bar = self.history_2min_bars.iloc[-2]
         prev_h = float(prev_bar["high"])
         prev_l = float(prev_bar["low"])
+        prev_c = float(prev_bar["close"])
 
-        curr_price = c
-        body_size = abs(c - o)
-        bar_range = h - l
-
-        if bar_range <= 0 or body_size <= 0:
+        rng = h - l
+        body = abs(c - o)
+        if rng <= 0 or body <= 0:
             return
 
         upper_wick = h - max(o, c)
         lower_wick = min(o, c) - l
-        body_ratio = body_size / bar_range if bar_range > 0 else 0.0
+        body_ratio = body / rng
+        close_pos = (c - l) / rng  # 0~1，越接近1收盘越贴近高点
 
-        dist_to_ma8 = abs(curr_price - self.ma8)
+        atr = float(self.effective_atr)
         ma20 = float(self.ma20)
-        ma200 = float(self.ma200) if self.ma200 is not None else None
+        ma8 = float(self.ma8)
+        ma200 = float(self.ma200)
 
-        # 门槛设定
-        extension_limit = self.effective_atr * 1.5  # 偏离极限
-        power_threshold = self.effective_atr * 0.5  # 最低实体力度门槛（保留）
-
-        is_green = c > o
-        is_red = c < o
-
-        # =========================================================
-        # 4) 2m 小周期语境：从“日志信息”升级为真实条件
-        # =========================================================
-        bull_2m_context_ok = (
-            ma200 is not None
-            and ma20 > ma200
-            and getattr(self, "is_ma20_turning_up", False)
-        ) or (getattr(self, "is_ma20_turning_up", False) and curr_price > ma20)
-
-        bear_2m_context_ok = (
-            ma200 is not None
-            and ma20 < ma200
-            and getattr(self, "is_ma20_turning_down", False)
-        ) or (getattr(self, "is_ma20_turning_down", False) and curr_price < ma20)
+        # 动态门槛（可外部配置）
+        ma8_ext_limit = atr * getattr(self, "law8_ma8_ext_atr_mult", 1.8)
+        body_atr_min = atr * getattr(self, "law8_body_atr_min", 0.35)
+        close_pos_min = getattr(self, "law8_close_pos_min", 0.60)
+        wick_body_max = getattr(self, "law8_wick_body_max", 0.50)
 
         # =========================================================
-        # 5) 当前 bar 自身质量审计
-        #    不再只看 ATR，加入 body_ratio + wick 质量
+        # 3) 15m 大趋势语境（共振基石）
         # =========================================================
-        bull_bar_quality_ok = (
-            body_size > power_threshold
+        is_15m_up = getattr(self, "is_15m_trending_up", False)
+        is_15m_down = getattr(self, "is_15m_trending_down", False)
+
+        # 若15m趋势标志未激活或冲突，直接过滤（Fab42 绝不做方向模糊交易）
+        if not (is_15m_up or is_15m_down):
+            return
+
+        # =========================================================
+        # 4) 2m 小周期语境 & 回调结构验证 (Pullback -> Test -> Reclaim)
+        # =========================================================
+        bull_struct_ok = False
+        bear_struct_ok = False
+
+        # 多头：要求之前有 2~5 根红柱回调，且曾回踩至 MA8/MA20 附近
+        if is_15m_up and 2 <= getattr(self, "last_red_count", 0) <= 5:
+            # 结构要件1：当前为趋势恢复第一根绿柱
+            if self.green_bar_count == 1:
+                # 结构要件2：回调低点曾触及或贴近 2m MA20 (允许 0.5 ATR 容差)
+                dip_near_ma20 = (self.low_of_dip > 0) and (
+                    abs(self.low_of_dip - ma20) <= atr * 0.6
+                )
+                # 结构要件3：2m 均线顺大势排列
+                ma20_aligned = (ma20 > ma200) and getattr(
+                    self, "is_ma20_turning_up", False
+                )
+                bull_struct_ok = dip_near_ma20 and ma20_aligned
+
+        # 空头：镜像逻辑
+        elif is_15m_down and 2 <= getattr(self, "last_green_count", 0) <= 5:
+            if self.red_bar_count == 1:
+                bounce_near_ma20 = (self.high_of_bounce > 0) and (
+                    abs(self.high_of_bounce - ma20) <= atr * 0.6
+                )
+                ma20_aligned = (ma20 < ma200) and getattr(
+                    self, "is_ma20_turning_down", False
+                )
+                bear_struct_ok = bounce_near_ma20 and ma20_aligned
+
+        if not (bull_struct_ok or bear_struct_ok):
+            return  # 缺乏健康回调语境，非 Fab42
+
+        # =========================================================
+        # 5) 空间过滤：MA8 偏离度审计（防追涨杀跌）
+        # =========================================================
+        dist_to_ma8 = abs(c - ma8)
+        if dist_to_ma8 > ma8_ext_limit:
+            return  # 价格已过度偏离短期均线，入场风险收益比失衡
+
+        # =========================================================
+        # 6) 核心判定：恢复控制权 + K线质量
+        # =========================================================
+        # 触发器：突破前柱极值，确认控制权交接
+        bull_reclaim = (c > o) and (h > prev_h)
+        bear_reclaim = (c < o) and (l < prev_l)
+
+        # 质量审计
+        bull_quality = (
+            body >= body_atr_min
             and body_ratio >= 0.50
-            and upper_wick <= 0.50 * body_size
+            and close_pos >= close_pos_min
+            and upper_wick <= body * wick_body_max
+        )
+        bear_quality = (
+            body >= body_atr_min
+            and body_ratio >= 0.50
+            and close_pos <= (1.0 - close_pos_min)
+            and lower_wick <= body * wick_body_max
         )
 
-        bear_bar_quality_ok = (
-            body_size > power_threshold
-            and body_ratio >= 0.50
-            and lower_wick <= 0.50 * body_size
-        )
-
         # =========================================================
-        # 6) 恢复控制权触发器
-        #    第一根变色柱 + 突破前一根极值
+        # 7) 状态触发与日志记录
         # =========================================================
-        bull_reclaim_ok = is_green and self.green_bar_count == 1 and h > prev_h
-        bear_reclaim_ok = is_red and self.red_bar_count == 1 and l < prev_l
+        if is_15m_up and bull_struct_ok and bull_reclaim and bull_quality:
+            self.ready_to_long_law8 = True
+            self.law8_sl = l
+            self.law8_trigger_high = h
+            self.law8_trigger_low = l
+            self.law8_entry_type = "Breakout"
 
-        # =========================================================
-        # 7) 核心判定逻辑
-        # =========================================================
+            ma20_status = (
+                "2m-MA20↑" if getattr(self, "is_ma20_turning_up", False) else "2m-MA20→"
+            )
+            self.sys_log(
+                f"🚀 [Law8L-Velez] 🟢 Fab42 Resonance | 15m:UP | {ma20_status} "
+                f"| 回调:{self.last_red_count}根 | 贴MA20:{dip_near_ma20} "
+                f"| 实体占比:{body_ratio:.2f} | ClosePos:{close_pos:.2f} "
+                f"| 偏离MA8:{dist_to_ma8/atr:.1f}xATR | 突破:{h:.3f}>{prev_h:.3f} | SL:{self.law8_sl:.2f}",
+                level="INFO",
+            )
 
-        # ---------------------------------------------------------
-        # 7.1 多头共振判定 (Bull Resonance)
-        # ---------------------------------------------------------
-        if self.is_15m_trending_up:
-            # A. 空间审计：检查是否过度拉升
-            if dist_to_ma8 <= extension_limit:
-                # B. 2m 语境 + 恢复控制权 + bar 质量
-                if bull_2m_context_ok and bull_reclaim_ok and bull_bar_quality_ok:
-                    self.ready_to_long_law8 = True
-                    self.law8_sl = l
-                    self.law8_trigger_high = h
-                    self.law8_trigger_low = l
-                    self.law8_entry_type = "Breakout"
-                    ma20_status = (
-                        "2m-MA20↑" if self.is_ma20_turning_up else "2m-MA20→/↓"
-                    )
+        elif is_15m_down and bear_struct_ok and bear_reclaim and bear_quality:
+            self.ready_to_short_law8 = True
+            self.law8_sl = h
+            self.law8_trigger_high = h
+            self.law8_trigger_low = l
+            self.law8_entry_type = "Breakout"
 
-                    self.sys_log(
-                        f"🚀 [Law#8-Velez] 🟢 Fab42 Resonance"
-                        f" | 15m:UP"
-                        f" | {ma20_status}"
-                        f" | reclaim:{bull_reclaim_ok}"
-                        f" | 实体:{body_size:.3f}"
-                        f" | 实体占比:{body_ratio:.2f}"
-                        f" | 偏离8MA:{dist_to_ma8:.3f}"
-                        f" | 突破:{h:.3f}>{prev_h:.3f}"
-                        f" | SL:{self.law8_sl:.2f}",
-                        level="INFO",
-                    )
-
-        # ---------------------------------------------------------
-        # 7.2 空头共振判定 (Bear Resonance)
-        # ---------------------------------------------------------
-        elif self.is_15m_trending_down:
-            if dist_to_ma8 <= extension_limit:
-                if bear_2m_context_ok and bear_reclaim_ok and bear_bar_quality_ok:
-                    self.ready_to_short_law8 = True
-                    self.law8_sl = h
-                    self.law8_trigger_high = h
-                    self.law8_trigger_low = l
-                    self.law8_entry_type = "Breakout"
-
-                    ma20_status = (
-                        "2m-MA20↓" if self.is_ma20_turning_down else "2m-MA20→/↑"
-                    )
-
-                    self.sys_log(
-                        f"🚀 [Law#8-Velez] 🔴 Fab42 Resonance"
-                        f" | 15m:DOWN"
-                        f" | {ma20_status}"
-                        f" | reclaim:{bear_reclaim_ok}"
-                        f" | 实体:{body_size:.3f}"
-                        f" | 实体占比:{body_ratio:.2f}"
-                        f" | 偏离8MA:{dist_to_ma8:.3f}"
-                        f" | 跌破:{l:.3f}<{prev_l:.3f}"
-                        f" | SL:{self.law8_sl:.2f}",
-                        level="INFO",
-                    )
+            ma20_status = (
+                "2m-MA20↓"
+                if getattr(self, "is_ma20_turning_down", False)
+                else "2m-MA20→"
+            )
+            self.sys_log(
+                f"🚀 [Law8S-Velez] 🔴 Fab42 Resonance | 15m:DOWN | {ma20_status} "
+                f"| 反弹:{self.last_green_count}根 | 贴MA20:{bounce_near_ma20} "
+                f"| 实体占比:{body_ratio:.2f} | ClosePos:{close_pos:.2f} "
+                f"| 偏离MA8:{dist_to_ma8/atr:.1f}xATR | 跌破:{l:.3f}<{prev_l:.3f} | SL:{self.law8_sl:.2f}",
+                level="INFO",
+            )
 
     def _detect_v180(self, new_bar):
         """
-        [V180] Power Shift Reversal (Velez Orthodox Version)
+        [V180] Power Shift Reversal (Velez Orthodox Fused Version)
 
-        职责：
-            识别两根 K 线构成的控制权翻转（180 度反转）信号：
-            前一根由一方控制，当前一根被另一方强势夺回主导权。
-
-        设计原则：
-        1. 保留 V180 核心：前红后绿 / 前绿后红 + 当前实体不小于前一实体
-        2. 增加当前 bar 的收盘控制力审计（更贴近 power shift）
-        3. 加入适度趋势语境，但不把 v180 压成纯 continuation
-        4. 保留 MA20 位置过滤
-        5. 将 washout 从硬门槛降级为增强标签
+        融合设计：
+        1. 时序安全：强制 Bar-Close 确认，杜绝盘中信号漂移
+        2. 趋势语境：收紧为“趋势延续”或“明确转折”语境，过滤走平震荡
+        3. 形态质量：参数化 close_pos / wick / body 阈值，保留 Washout 标签
+        4. 止损呼吸：结构极值外扩 0.15 ATR，防微观毛刺扫损
+        5. 工程健壮：全阈值 getattr 动态加载，支持回测网格优化
         """
-
         # =========================================================
-        # 1) 初始化标志位，防止旧状态污染
+        # 0) 状态重置（防跨Bar污染）
         # =========================================================
         self.ready_to_long_v180 = False
         self.ready_to_short_v180 = False
@@ -2908,26 +3599,30 @@ class TradingContext:
         self.v180_entry_type = None
 
         # =========================================================
-        # 2) 物理审计
+        # 1) 时序安全与基础依赖校验
         # =========================================================
-        if not hasattr(self, "effective_atr"):
+        # 🔒 核心防重绘：仅对已闭合Bar计算
+        if not getattr(new_bar, "is_closed", True):
+            return
+        if (
+            not hasattr(self, "effective_atr")
+            or self.effective_atr is None
+            or self.effective_atr <= 0
+        ):
             return
         if self.ma20 is None:
             return
-        if not hasattr(self, "ma200"):
+        if not hasattr(self, "ma200") or self.ma200 is None:
             return
-        if not hasattr(self, "is_ma20_turning_up") or not hasattr(
-            self, "is_ma20_turning_down"
-        ):
-            return
-        if len(self.history_2min_bars) < 2:
+        # 需足够历史柱验证双Bar结构
+        if len(self.history_2min_bars) < 3:
             return
 
+        # =========================================================
+        # 2) K线物理与历史数据提取
+        # =========================================================
+        # 注意：process_new_2min_bar 已先将 new_bar 追加至 history，故 -1 为 T，-2 为 T-1
         prev_bar = self.history_2min_bars.iloc[-2]
-
-        # =========================================================
-        # 3) 基础数据计算
-        # =========================================================
         prev_open = float(prev_bar["open"])
         prev_high = float(prev_bar["high"])
         prev_low = float(prev_bar["low"])
@@ -2940,148 +3635,131 @@ class TradingContext:
 
         body_prev = abs(prev_close - prev_open)
         body_curr = abs(curr_close - curr_open)
-        total_range_curr = curr_high - curr_low
+        rng_curr = curr_high - curr_low
 
-        if total_range_curr <= 0 or body_curr <= 0:
+        if rng_curr <= 0 or body_curr <= 0:
             return
-
-        dist_to_ma20 = abs(curr_close - self.ma20)
 
         upper_wick = curr_high - max(curr_open, curr_close)
         lower_wick = min(curr_open, curr_close) - curr_low
+        close_pos = (curr_close - curr_low) / rng_curr  # 0~1
 
-        close_position_from_low = (curr_close - curr_low) / total_range_curr
-        close_position_from_high = (curr_high - curr_close) / total_range_curr
-
+        atr = float(self.effective_atr)
         ma20 = float(self.ma20)
-        ma200 = float(self.ma200) if self.ma200 is not None else None
+        ma200 = float(self.ma200)
+        dist_to_ma20 = abs(curr_close - ma20)
+
+        # 动态门槛（可外部配置）
+        close_pos_min = getattr(self, "v180_close_pos_min", 0.60)
+        wick_body_max = getattr(self, "v180_wick_body_max", 0.50)
+        min_body_atr = getattr(self, "v180_min_body_atr_mult", 0.35)
+        near_ma_limit = atr * getattr(self, "v180_near_ma_atr_mult", 1.5)
+        sl_buffer = atr * getattr(self, "v180_sl_buffer_atr_mult", 0.15)
 
         # =========================================================
-        # 4) 门槛设定
+        # 3) 趋势语境审计（Velez 原教旨：延续优先，转折需明确）
         # =========================================================
-        near_ma_limit = self.effective_atr * 1.5
-        min_body_threshold = self.effective_atr * 0.4
+        is_super_up = getattr(self, "is_super_uptrend", False)
+        is_super_down = getattr(self, "is_super_downtrend", False)
+        ma20_up = getattr(self, "is_ma20_turning_up", False)
+        ma20_down = getattr(self, "is_ma20_turning_down", False)
 
-        # =========================================================
-        # 5) 基础 V180 形态：颜色翻转 + 当前实体 >= 前实体
-        # =========================================================
-        is_bull_v180_shape = (
-            (prev_close < prev_open)
-            and (curr_close > curr_open)
-            and (body_curr >= body_prev)
+        # 多头语境：超级趋势 或 (MA20>MA200 + 价格在MA20上 + MA20向上/走平)
+        bull_context_ok = is_super_up or (
+            ma20 > ma200 and curr_close >= ma20 and (ma20_up or not ma20_down)
+        )
+        # 空头语境：超级趋势 或 (MA20<MA200 + 价格在MA20下 + MA20向下/走平)
+        bear_context_ok = is_super_down or (
+            ma20 < ma200 and curr_close <= ma20 and (ma20_down or not ma20_up)
         )
 
-        is_bear_v180_shape = (
-            (prev_close > prev_open)
-            and (curr_close < curr_open)
-            and (body_curr >= body_prev)
-        )
+        # 若双向语境均不满足（通常意味着均线走平/震荡），直接过滤
+        if not (bull_context_ok or bear_context_ok):
+            return
 
         # =========================================================
-        # 6) 当前 bar 的“收盘控制力”审计
-        #    Bull: 收盘应靠近高位，且上影线不能太重
-        #    Bear: 收盘应靠近低位，且下影线不能太重
+        # 4) 位置与 Washout 审计
         # =========================================================
-        bull_close_control_ok = (
-            close_position_from_low >= 0.60 and upper_wick <= 0.50 * body_curr
-        )
+        # 位置：必须贴近 MA20（除非是超级趋势）
+        bull_location_ok = is_super_up or (dist_to_ma20 <= near_ma_limit)
+        bear_location_ok = is_super_down or (dist_to_ma20 <= near_ma_limit)
 
-        bear_close_control_ok = (
-            close_position_from_high >= 0.60 and lower_wick <= 0.50 * body_curr
-        )
-
-        # =========================================================
-        # 7) 趋势语境：适度加入，不把 v180 压得过死
-        # =========================================================
-        bull_context_ok = (
-            getattr(self, "is_super_uptrend", False)
-            or (ma200 is not None and ma20 > ma200 and curr_close >= ma20)
-            or (getattr(self, "is_ma20_turning_up", False) and curr_close >= ma20)
-        )
-
-        bear_context_ok = (
-            getattr(self, "is_super_downtrend", False)
-            or (ma200 is not None and ma20 < ma200 and curr_close <= ma20)
-            or (getattr(self, "is_ma20_turning_down", False) and curr_close <= ma20)
-        )
-
-        # =========================================================
-        # 8) washout：由硬门槛降级为增强标签
-        # =========================================================
+        # Washout：刺穿前Bar极值（增强标签，非硬过滤）
         bull_has_washout = curr_low <= prev_low
         bear_has_washout = curr_high >= prev_high
 
         # =========================================================
-        # 9) 位置审计：靠近 MA20，SuperTrend 可放宽
+        # 5) 核心判定：权力翻转 + 收盘控制力 + 语境
         # =========================================================
-        bull_location_ok = getattr(self, "is_super_uptrend", False) or (
-            dist_to_ma20 <= near_ma_limit
+        # 形态：颜色翻转 + 当前实体强度达标
+        bull_shape = (
+            (prev_close < prev_open)
+            and (curr_close > curr_open)
+            and (body_curr >= body_prev * 0.85)
         )
-        bear_location_ok = getattr(self, "is_super_downtrend", False) or (
-            dist_to_ma20 <= near_ma_limit
+        bear_shape = (
+            (prev_close > prev_open)
+            and (curr_close < curr_open)
+            and (body_curr >= body_prev * 0.85)
         )
 
+        # 收盘控制力
+        bull_control = (close_pos >= close_pos_min) and (
+            upper_wick <= body_curr * wick_body_max
+        )
+        bear_control = (close_pos <= (1.0 - close_pos_min)) and (
+            lower_wick <= body_curr * wick_body_max
+        )
+
+        # 动能底线
+        enough_power = body_curr >= (atr * min_body_atr)
+
         # =========================================================
-        # 10) Bull V180
+        # 6) 状态触发与日志记录
         # =========================================================
         if (
-            is_bull_v180_shape
-            and body_curr > min_body_threshold
-            and bull_close_control_ok
+            bull_shape
+            and enough_power
+            and bull_control
             and bull_context_ok
             and bull_location_ok
         ):
             self.ready_to_long_v180 = True
-            self.v180_sl = min(curr_low, prev_low)
+            self.v180_sl = min(curr_low, prev_low) - sl_buffer  # 🔴 增加呼吸空间
             self.v180_trigger_high = curr_high
             self.v180_trigger_low = curr_low
             self.v180_entry_type = "Breakout"
 
-            strength_tag = "Washout+" if bull_has_washout else "Standard"
-            engulf_ratio = (body_curr / max(body_prev, 0.001)) * 100
+            strength_tag = "🌊 Washout+ " if bull_has_washout else "⚡ Standard "
+            engulf_pct = (body_curr / max(body_prev, 0.001)) * 100
 
             self.sys_log(
-                f"🔄 [V180-Velez] 🟢 Bull V180"
-                f" | 类型:{strength_tag}"
-                f" | 吞没率:{engulf_ratio:.0f}%"
-                f" | 收盘位置:{close_position_from_low:.2f}"
-                f" | 距MA20:{dist_to_ma20:.3f}"
-                f" | context_ok:{bull_context_ok}"
-                f" | location_ok:{bull_location_ok}"
-                f" | washout:{bull_has_washout}"
-                f" | SL:{self.v180_sl:.2f}",
+                f"🔄 [V180L-Velez] 🟢 Power Shift | {strength_tag} 吞没率:{engulf_pct:.0f}% "
+                f"| 收盘位:{close_pos:.2f} | 距MA20:{dist_to_ma20/atr:.1f}xATR "
+                f"| 语境:{bull_context_ok} | 位置:{bull_location_ok} | SL:{self.v180_sl:.2f}",
                 level="INFO",
             )
 
-        # =========================================================
-        # 11) Bear V180
-        # =========================================================
         elif (
-            is_bear_v180_shape
-            and body_curr > min_body_threshold
-            and bear_close_control_ok
+            bear_shape
+            and enough_power
+            and bear_control
             and bear_context_ok
             and bear_location_ok
         ):
             self.ready_to_short_v180 = True
-            self.v180_sl = max(curr_high, prev_high)
+            self.v180_sl = max(curr_high, prev_high) + sl_buffer  # 🔴 增加呼吸空间
             self.v180_trigger_high = curr_high
             self.v180_trigger_low = curr_low
             self.v180_entry_type = "Breakout"
 
-            strength_tag = "Washout+" if bear_has_washout else "Standard"
-            engulf_ratio = (body_curr / max(body_prev, 0.001)) * 100
+            strength_tag = "🌊 Washout+ " if bear_has_washout else "⚡ Standard "
+            engulf_pct = (body_curr / max(body_prev, 0.001)) * 100
 
             self.sys_log(
-                f"🔄 [V180-Velez] 🔴 Bear V180"
-                f" | 类型:{strength_tag}"
-                f" | 吞没率:{engulf_ratio:.0f}%"
-                f" | 收盘位置:{close_position_from_high:.2f}"
-                f" | 距MA20:{dist_to_ma20:.3f}"
-                f" | context_ok:{bear_context_ok}"
-                f" | location_ok:{bear_location_ok}"
-                f" | washout:{bear_has_washout}"
-                f" | SL:{self.v180_sl:.2f}",
+                f"🔄 [V180S-Velez] 🔴 Power Shift | {strength_tag} 吞没率:{engulf_pct:.0f}% "
+                f"| 收盘位:{close_pos:.2f} | 距MA20:{dist_to_ma20/atr:.1f}xATR "
+                f"| 语境:{bear_context_ok} | 位置:{bear_location_ok} | SL:{self.v180_sl:.2f}",
                 level="INFO",
             )
 
@@ -3163,10 +3841,10 @@ class TradingContext:
             return
 
         self.last_confirmed_tail = self.current_tail_type
-        self._reset_all_ready_flags()
+        # self._reset_all_ready_flags()
         self._detect_tail_bars(new_bar)
 
-        self._detect_law1(new_bar)  # Elephant Bar (大象柱)
+        # self._detect_law1(new_bar)  # Elephant Bar (大象柱)
         self._detect_law2(new_bar)  # Color Change (颜色改变)
         self._detect_law3(new_bar)  # 3-5 Bars (回调反转)
         self._detect_law4(new_bar)  # RBI/GBI (忽略柱/影线延续)
@@ -3178,114 +3856,277 @@ class TradingContext:
 
     def _select_signal(self):
         """
-        [决策层-A1] 按优先级选出当前最高等级信号
-        返回:
-            side, label, raw_sl, trigger_high, trigger_low, entry_type
+        [决策层-A1] Velez 原教旨信号优先级选择器 (动态语境版)
+
+        核心逻辑：
+        1. 趋势延续 > 趋势反转 (Velez 仓位分配核心)
+        2. 回踩/贴近 20MA 入场 > 远离 20MA 追涨杀跌
+        3. 多周期共振 (Law8) 与 结构回踩 (Law3/4/6) 优先于单一形态突破
+        4. 反转信号 (Law2/V180) 仅在价格偏离 20MA 过远或趋势衰竭时放行
         """
-        side, label = None, ""
-        raw_sl, trigger_high, trigger_low, entry_type = None, None, None, None
+        # --- 1. 安全获取当前价格与语境 ---
+        curr_price = (
+            float(self.history_2min_bars["close"].iloc[-1])
+            if not self.history_2min_bars.empty
+            else 0.0
+        )
+        ma20_val = getattr(self, "ma20", 0.0)
+        ma200_val = getattr(self, "ma200", 0.0)
+        atr = getattr(self, "effective_atr", 0.5)
 
-        # 梯队 I
-        if self.ready_to_long_law1 or self.ready_to_short_law1:
-            side = "LONG" if self.ready_to_long_law1 else "SHORT"
-            label = "Law1L" if self.ready_to_long_law1 else "Law1S"
-            raw_sl = self.law1_sl
-            trigger_high = self.law1_trigger_high
-            trigger_low = self.law1_trigger_low
-            entry_type = self.law1_entry_type
+        dist_to_ma20 = abs(curr_price - ma20_val)
+        is_trending_up = (ma20_val > ma200_val) and getattr(
+            self, "is_ma20_turning_up", False
+        )
+        is_trending_down = (ma20_val < ma200_val) and getattr(
+            self, "is_ma20_turning_down", False
+        )
+        is_overextended = dist_to_ma20 > (2.5 * atr)  # 偏离 2.5倍ATR 视为超买/超卖区
 
-        elif self.ready_to_long_law2 or self.ready_to_short_law2:
-            side = "LONG" if self.ready_to_long_law2 else "SHORT"
-            label = "Law2L" if self.ready_to_long_law2 else "Law2S"
-            raw_sl = self.law2_sl
-            trigger_high = self.law2_trigger_high
-            trigger_low = self.law2_trigger_low
-            entry_type = self.law2_entry_type
+        # --- 辅助：过滤逆趋势噪音 ---
+        def align_with_trend(is_long):
+            if is_trending_up:
+                return is_long
+            if is_trending_down:
+                return not is_long
+            return True  # 震荡市不拦截，交由后续止损过滤
 
-        elif self.ready_to_long_v180 or self.ready_to_short_v180:
-            side = "LONG" if self.ready_to_long_v180 else "SHORT"
-            label = "V180L" if self.ready_to_long_v180 else "V180S"
-            raw_sl = self.v180_sl
-            trigger_high = self.v180_trigger_high
-            trigger_low = self.v180_trigger_low
-            entry_type = self.v180_entry_type
+        selected = None
 
-        elif self.ready_to_long_law4 or self.ready_to_short_law4:
-            side = "LONG" if self.ready_to_long_law4 else "SHORT"
-            label = "Law4L" if self.ready_to_long_law4 else "Law4S"
-            raw_sl = self.law4_sl
-            trigger_high = self.law4_trigger_high
-            trigger_low = self.law4_trigger_low
-            entry_type = self.law4_entry_type
+        # ================= 梯队 I: 核心回踩/测试信号 (最高胜率 & 最佳盈亏比) =================
+        # Law3/4/6 是 Velez 最推崇的 "Trend + Pullback + Reclaim" 结构，风险最低，盈亏比最佳
+        pullback_candidates = [
+            (
+                "Law3L",
+                self.ready_to_long_law3,
+                self.law3_sl,
+                self.law3_trigger_high,
+                self.law3_trigger_low,
+                self.law3_entry_type,
+            ),
+            (
+                "Law3S",
+                self.ready_to_short_law3,
+                self.law3_sl,
+                self.law3_trigger_high,
+                self.law3_trigger_low,
+                self.law3_entry_type,
+            ),
+            (
+                "Law4L",
+                self.ready_to_long_law4,
+                self.law4_sl,
+                self.law4_trigger_high,
+                self.law4_trigger_low,
+                self.law4_entry_type,
+            ),
+            (
+                "Law4S",
+                self.ready_to_short_law4,
+                self.law4_sl,
+                self.law4_trigger_high,
+                self.law4_trigger_low,
+                self.law4_entry_type,
+            ),
+            (
+                "Law6L",
+                self.ready_to_long_law6,
+                self.law6_sl,
+                self.law6_trigger_high,
+                self.law6_trigger_low,
+                self.law6_entry_type,
+            ),
+            (
+                "Law6S",
+                self.ready_to_short_law6,
+                self.law6_sl,
+                self.law6_trigger_high,
+                self.law6_trigger_low,
+                self.law6_entry_type,
+            ),
+        ]
+        for cand in pullback_candidates:
+            label, ready, sl, th, tl, et = cand
+            if ready and align_with_trend("L" in label):
+                selected = cand
+                break
 
-        # 梯队 II
-        elif self.ready_to_long_law6 or self.ready_to_short_law6:
-            side = "LONG" if self.ready_to_long_law6 else "SHORT"
-            label = "Law6L" if self.ready_to_long_law6 else "Law6S"
-            raw_sl = self.law6_sl
-            trigger_high = self.law6_trigger_high
-            trigger_low = self.law6_trigger_low
-            entry_type = self.law6_entry_type
+        # ================= 梯队 II: 多周期共振 & 20MA 收复信号 =================
+        if not selected:
+            mt_resonance_candidates = [
+                (
+                    "Law8L",
+                    self.ready_to_long_law8,
+                    self.law8_sl,
+                    self.law8_trigger_high,
+                    self.law8_trigger_low,
+                    self.law8_entry_type,
+                ),
+                (
+                    "Law8S",
+                    self.ready_to_short_law8,
+                    self.law8_sl,
+                    self.law8_trigger_high,
+                    self.law8_trigger_low,
+                    self.law8_entry_type,
+                ),
+                (
+                    "Law5L",
+                    self.ready_to_long_law5,
+                    self.law5_sl,
+                    self.law5_trigger_high,
+                    self.law5_trigger_low,
+                    self.law5_entry_type,
+                ),
+                (
+                    "Law5S",
+                    self.ready_to_short_law5,
+                    self.law5_sl,
+                    self.law5_trigger_high,
+                    self.law5_trigger_low,
+                    self.law5_entry_type,
+                ),
+            ]
+            for cand in mt_resonance_candidates:
+                label, ready, sl, th, tl, et = cand
+                if ready and align_with_trend("L" in label):
+                    selected = cand
+                    break
 
-        elif self.ready_to_long_law3 or self.ready_to_short_law3:
-            side = "LONG" if self.ready_to_long_law3 else "SHORT"
-            label = "Law3L" if self.ready_to_long_law3 else "Law3S"
-            raw_sl = self.law3_sl
-            trigger_high = self.law3_trigger_high
-            trigger_low = self.law3_trigger_low
-            entry_type = self.law3_entry_type
+        # ================= 梯队 III: 动能突破 (Law1 大象柱) =================
+        # 仅在顺趋势且未严重超买/超卖时触发，避免 Exhaustion Trap
+        if not selected:
+            momentum_candidates = [
+                (
+                    "Law1L",
+                    self.ready_to_long_law1,
+                    self.law1_sl,
+                    self.law1_trigger_high,
+                    self.law1_trigger_low,
+                    self.law1_entry_type,
+                ),
+                (
+                    "Law1S",
+                    self.ready_to_short_law1,
+                    self.law1_sl,
+                    self.law1_trigger_high,
+                    self.law1_trigger_low,
+                    self.law1_entry_type,
+                ),
+            ]
+            for cand in momentum_candidates:
+                label, ready, sl, th, tl, et = cand
+                if ready and align_with_trend("L" in label) and not is_overextended:
+                    selected = cand
+                    break
 
-        # 梯队 III
-        elif self.ready_to_long_law8 or self.ready_to_short_law8:
-            side = "LONG" if self.ready_to_long_law8 else "SHORT"
-            label = "Law8L" if self.ready_to_long_law8 else "Law8S"
-            raw_sl = self.law8_sl
-            trigger_high = self.law8_trigger_high
-            trigger_low = self.law8_trigger_low
-            entry_type = self.law8_entry_type
+        # ================= 梯队 IV: 反转信号 (Law2 / V180) =================
+        # Velez 原教旨：反转只在极端偏离或关键位做。此处放行但建议结合 plan_trade 的 R:R 过滤
+        if not selected:
+            reversal_candidates = [
+                (
+                    "Law2L",
+                    self.ready_to_long_law2,
+                    self.law2_sl,
+                    self.law2_trigger_high,
+                    self.law2_trigger_low,
+                    self.law2_entry_type,
+                ),
+                (
+                    "Law2S",
+                    self.ready_to_short_law2,
+                    self.law2_sl,
+                    self.law2_trigger_high,
+                    self.law2_trigger_low,
+                    self.law2_entry_type,
+                ),
+                (
+                    "V180L",
+                    self.ready_to_long_v180,
+                    self.v180_sl,
+                    self.v180_trigger_high,
+                    self.v180_trigger_low,
+                    self.v180_entry_type,
+                ),
+                (
+                    "V180S",
+                    self.ready_to_short_v180,
+                    self.v180_sl,
+                    self.v180_trigger_high,
+                    self.v180_trigger_low,
+                    self.v180_entry_type,
+                ),
+            ]
+            for cand in reversal_candidates:
+                label, ready, sl, th, tl, et = cand
+                if ready:  # 反转信号允许触发，但通常偏离较大，plan_trade 会自动计算 R:R
+                    selected = cand
+                    break
 
-        elif self.ready_to_long_law5 or self.ready_to_short_law5:
-            side = "LONG" if self.ready_to_long_law5 else "SHORT"
-            label = "Law5L" if self.ready_to_long_law5 else "Law5S"
-            raw_sl = self.law5_sl
-            trigger_high = self.law5_trigger_high
-            trigger_low = self.law5_trigger_low
-            entry_type = self.law5_entry_type
+        # --- 返回结果 ---
+        if selected:
+            label, _, sl, th, tl, et = selected
+            side = "LONG" if "L" in label else "SHORT"
+            trend_ctx = (
+                "UP" if is_trending_up else ("DOWN" if is_trending_down else "RANGE")
+            )
+            self.sys_log(
+                f"🎯 [_select_signal 选中] {label} | 趋势语境:{trend_ctx} | 偏离MA20:{dist_to_ma20:.2f}",
+                level="INFO",
+            )
+            return side, label, sl, th, tl, et
 
-        return side, label, raw_sl, trigger_high, trigger_low, entry_type
+        return None, "", None, None, None, None
 
     def _compute_entry_price(self, side, trigger_high, trigger_low, entry_type):
         """
-        [决策层-A2] 统一入场价格计算器
+        统一计算入场价格
+        支持：
+        1. Breakout
+        2. GiftZone
+
+        规则：
+        - LONG 统一使用 trigger_high + 1 tick
+        - SHORT 统一使用 trigger_low - 1 tick
+
+        注意：
+        Breakout 与 GiftZone 的公式形式相同，
+        区别只在 trigger_high / trigger_low 的来源不同。
         """
+        tick_size = 0.01
+
         if side not in ("LONG", "SHORT"):
             return None
 
         if trigger_high is None or trigger_low is None:
             return None
 
-        if not entry_type:
+        if entry_type not in ("Breakout", "GiftZone"):
             return None
 
-        min_tick = 0.01  # 当前仅针对美股科技股
+        if side == "LONG":
+            return round(float(trigger_high) + tick_size, 2)
 
-        if entry_type == "Breakout":
-            if side == "LONG":
-                return round(float(trigger_high) + min_tick, 2)
-            else:
-                return round(float(trigger_low) - min_tick, 2)
+        if side == "SHORT":
+            return round(float(trigger_low) - tick_size, 2)
 
-        # 未来如需支持 GiftZone / Retest，可在这里扩展
         return None
 
     def analyze_signals(self, current_price, vix):
         """
         [决策层-A] 信号分拣与宏观审计
         职责：
-        1. 按优先级选出唯一有效信号
-        2. 做趋势 / MA20 / 15m 背离过滤
-        3. 统一计算 entry_price
+        1. 优先检查 Law1_GiftZone pending 是否成熟
+        2. 若未成熟，再按原优先级选出唯一有效信号
+        3. 做趋势 / MA20 / 15m 背离过滤
+        4. 统一计算 entry_price
+        5. 若 GifZone packet 已形成，则在返回前执行 pending 归位
         """
+        curr_time = datetime.now(EASTERN_TZ).time()
+        curr_dt = datetime.now(EASTERN_TZ)
+        if curr_time < time(10, 0) or curr_time > time(12, 0):
+            return None
+
         # 1) 熔断直接返回
         if self.suspend_today:
             self.sys_log(
@@ -3294,7 +4135,20 @@ class TradingContext:
             )
             return None
 
-        # 2) 选信号
+        pending_consumed = False
+
+        # 2) 优先检查 Law1_GiftZone pending 是否已成熟
+        # pending_packet = self._evaluate_law1_pending()
+        # if pending_packet:
+        #    side = pending_packet["side"]
+        #    label = pending_packet["label"]
+        #    raw_sl = pending_packet["raw_sl"]
+        #    trigger_high = pending_packet["trigger_high"]
+        #    trigger_low = pending_packet["trigger_low"]
+        #    entry_type = pending_packet["entry_type"]
+        #    pending_consumed = True
+        # else:
+        # 3) 若没有成熟的 GiftZone，再走原来的多信号筛选
         (
             side,
             label,
@@ -3304,7 +4158,7 @@ class TradingContext:
             entry_type,
         ) = self._select_signal()
 
-        # 3) 基础合法性检查
+        # 4) 基础合法性检查
         if side not in ("LONG", "SHORT"):
             return None
         if not label:
@@ -3316,7 +4170,7 @@ class TradingContext:
         if not entry_type:
             return None
 
-        # 4) MA20 过滤
+        # 5) MA20 过滤
         if side == "LONG" and current_price < self.ma20:
             self.sys_log(
                 f"🚫 [拒绝信号] {label} 原因：多头信号在 20MA 下方 "
@@ -3333,29 +4187,29 @@ class TradingContext:
             )
             return None
 
-        # 5) 15m 背离过滤
+        # 6) 15m 背离过滤
         is_15m_up = getattr(self, "is_15m_trending_up", None)
         is_15m_down = getattr(self, "is_15m_trending_down", None)
 
         if side == "LONG" and is_15m_up is not None and not is_15m_up:
             last_update = getattr(self, "last_15m_update_time", "N/A")
             self.sys_log(
-                f"🛠️ ⚠️ [趋势背离] 2min已排布，但15min未转向向上，信号拦截"
+                f"🛠️ ⚠️ [Warning:趋势背离] 2min已排布，但15min未转向向上，信号拦截"
                 f" | {label} | 15m趋势:DOWN/SIDE | 缓存更新:{last_update}",
                 level="WARN",
             )
-            return None
+            # return None
 
         if side == "SHORT" and is_15m_down is not None and not is_15m_down:
             last_update = getattr(self, "last_15m_update_time", "N/A")
             self.sys_log(
-                f"🛠️ ⚠️ [趋势背离] 2min已排布，但15min未转向向下，信号拦截"
+                f"🛠️ ⚠️ [Warning:趋势背离] 2min已排布，但15min未转向向下，信号拦截"
                 f" | {label} | 15m趋势:UP/SIDE | 缓存更新:{last_update}",
                 level="WARN",
             )
-            return None
+            # return None
 
-        # 6) MA200 警告
+        # 7) MA200 警告
         if getattr(self, "ma200", None) is not None:
             if side == "LONG" and current_price < self.ma200:
                 self.sys_log(
@@ -3368,7 +4222,7 @@ class TradingContext:
                     level="DEBUG",
                 )
 
-        # 7) 统一计算 entry_price
+        # 8) 统一计算 entry_price
         entry_price = self._compute_entry_price(
             side=side,
             trigger_high=trigger_high,
@@ -3383,7 +4237,19 @@ class TradingContext:
             )
             return None
 
-        # 8) 风控方向检查
+        actual_gap = abs(entry_price - raw_sl)
+
+        # 检查入场价格 entry_price 到 止损价格raw_sl之间的间距，如果小于stop_min_gap则不下单（因为容易被噪音踢出)
+        if actual_gap < self.stop_min_gap:
+            self.sys_log(
+                f"🚫 [拒绝信号] {label} 入场价格与止损价格之间的间距 < 最小间距stop_min_gap "
+                f"(Raw_SL:{raw_sl:.2f}, Entry_price:{entry_price:.2f}), "
+                f"(Stop_min_gap:{self.stop_min_gap:.2f}, 实际gap:{actual_gap:.2f})",
+                level="ERROR",
+            )
+            return None
+
+        # 9) 风控方向检查
         if side == "LONG" and raw_sl >= entry_price:
             self.sys_log(
                 f"🚫 [拒绝信号] {label} 原因：多头止损不合法 "
@@ -3400,7 +4266,11 @@ class TradingContext:
             )
             return None
 
-        # 9) 输出 packet
+        # 10) 若本次返回的是已成熟 GiftZone，则在形成最终packet后归位
+        # if pending_consumed:
+        #    self._clear_law1_pending()
+
+        # 11) 输出 packet
         self.sys_log(
             f"🧭 [信号确认] {label}"
             f" | side:{side}"
@@ -3429,7 +4299,16 @@ class TradingContext:
             vix_multiplier: float
         """
         vix_value = shared.global_last_vix_close
-        vix_multiplier = 1.0
+        if vix_value >= 30:
+            vix_multiplier = 0.0
+            self.sys_log(
+                f"🚫 [VIX 熔断] VIX={vix_value:.2f} ≥ 30，禁止入场",
+                level="WARN",
+            )
+        else:
+            vix_multiplier = 1.0
+
+        # return vix_multiplier  # 测试时候使用，投产时候把这行注释掉
 
         if vix_value is not None:
             if vix_value < 15:
@@ -3446,7 +4325,6 @@ class TradingContext:
                     f"🚫 [VIX 熔断] VIX={vix_value:.2f} ≥ 30，禁止入场",
                     level="WARN",
                 )
-                return None
 
             self.sys_log(
                 f"📊 [VIX 仓位调节] VIX={vix_value:.2f} → 仓位系数={vix_multiplier*100:.0f}%",
@@ -3522,7 +4400,6 @@ class TradingContext:
 
         # --- 4. ATR 与参考价 ---
         atr = self.effective_atr
-        min_gap = round(1.0 * atr, 2)
 
         reference_price = (
             snapshot.avg_cost
@@ -3532,23 +4409,28 @@ class TradingContext:
 
         # --- 5. 止损与止盈计算 ---
         if side == "LONG":
-            sl_candidate = raw_sl
-            sl_tightened = reference_price - min_gap
-            sl = round(max(sl_candidate, sl_tightened), 2)
-            r = abs(entry - sl)
-            tp1 = reference_price + 1.5 * r
-            tp2 = reference_price + 3.0 * r
-
+            
+            r = abs(reference_price - raw_sl)
+            sl = round(raw_sl, 2)    #止损价格放在入场价格下方 1R的地方
+            if atr > 0.5 * r:  # 高波动股票
+                tp1 = round(reference_price + 2.5 * r, 2)
+                tp2 = round(reference_price + 3.0 * r, 2)
+            else:  # 低波动股票
+                tp1 = round(reference_price + 2.0 * r, 2)
+                tp2 = round(reference_price + 3.0 * r, 2)
         else:  # SHORT
-            sl_candidate = raw_sl
-            sl_tightened = reference_price + min_gap
-            sl = round(min(sl_candidate, sl_tightened), 2)
-            r = abs(sl - entry)
-            tp1 = reference_price - 1.5 * r
-            tp2 = reference_price - 3.0 * r
+            
+            r = abs(raw_sl - reference_price)
+            sl = round(raw_sl, 2)   #止损价格放在入场价格上方1R的位置
+            if atr > 0.5 * r:  # 高波动股票
+                tp1 = round(reference_price - 2.5 * r, 2)
+                tp2 = round(reference_price - 3.0 * r, 2)
+            else:  # 低波动股票
+                tp1 = round(reference_price - 2.0 * r, 2)
+                tp2 = round(reference_price - 3.0 * r, 2)
 
         # --- 6. 风险距离与收益比审计 ---
-        risk_dist = round(abs(entry - sl), 2)
+        risk_dist = round(abs(reference_price - sl), 2)
         if risk_dist <= 0:
             self.sys_log(
                 f"🚫 [风控拦截] {label} 止损距离无效 (risk_dist={risk_dist:.3f})",
@@ -3562,20 +4444,8 @@ class TradingContext:
             level="DEBUG",
         )
 
-        reward_potential = round(abs(tp1 - entry), 2)
-        rr_ratio = reward_potential / risk_dist if risk_dist > 0 else 0
-
-        min_rr_ratio = 1.5
-        if rr_ratio < min_rr_ratio:
-            self.sys_log(
-                f"⚠️ [放弃] {label} 盈亏比{rr_ratio:.2f}:1 < {min_rr_ratio}:1 | "
-                f"risk:{risk_dist/atr:.1f}ATR, reward:{reward_potential/atr:.1f}ATR",
-                level="WARN",
-            )
-            return None
         # --- 7. 股数计算 ---
-        suggested_shares = int(current_risk_money // risk_dist)
-        suggested_shares = int(suggested_shares * vix_multiplier)
+        suggested_shares = int((current_risk_money // risk_dist) * vix_multiplier)
 
         if not snapshot.has_position:
             shares = min(suggested_shares, self.max_qty)
@@ -3665,7 +4535,7 @@ class TradingContext:
             level="INFO",
         )
         self.sys_log(
-            f"📝 [入场指令(1)] {action} {shares}股 | trigger={entry:.2f} | lmt={lmt_price:.2f} | SL={sl:.2f}",
+            f"📝 [入场指令(1)] {action} {shares}股 | EntryPrice={entry:.2f} | lmt={lmt_price:.2f} | SL={sl:.2f}",
             level="INFO",
         )
         self.sys_log(
@@ -3705,7 +4575,10 @@ class TradingContext:
                 for o in snapshot.live_orders
             )
             if has_intent_in_flight:
-                # self.sys_log(f"🛰️ [决策拦截] 柜台已有在途指令，放弃信号 {packet['label']}", level="DEBUG")
+                self.sys_log(
+                    f"🛰️ [拦截] 已有在途下单指令，放弃信号 {packet['label']}",
+                    level="DEBUG",
+                )
                 return
 
             # B. 准入逻辑重塑：空仓入场 或 符合条件的加仓
@@ -3734,7 +4607,7 @@ class TradingContext:
 
             # --- 4. 时间闸门拦截 ---
             now_et = datetime.now(EASTERN_TZ).time()
-            if not (time(10, 0) <= now_et <= time(15, 30)):
+            if not (time(10, 0) <= now_et <= time(12, 0)):
                 self.sys_log(
                     f"🚫 [时间禁令] 当前时间{now_et}，程序在9:30-10:00以及15:30-15:58两个时间段禁止入场交易，仅记录信号或者被动止盈止损。",
                     level="INFO",
@@ -3753,6 +4626,9 @@ class TradingContext:
         [策略层 - 追踪引擎] Velez 移动止损追踪函数
         """
         if not snapshot.active_stop_order:
+            self.tp1_trail_anchor = None
+            self.tp1_trail_side = None
+            self.tp1_trail_cost = None
             return None
 
         if (getattr(snapshot.active_stop_order, "orderRef", "") or "").startswith(
@@ -3762,13 +4638,20 @@ class TradingContext:
         try:
             side = snapshot.direction
             cost = snapshot.avg_cost
-            atr = self.effective_atr
             current_sl = None
+            atr = self.effective_atr
             r = abs(cost - self.initial_stop_price)
+            if r <= 0:
+                self.sys_log(
+                    f"⚠️ [_trailing_stop] R 非法，cost={cost:.3f} | initial_stop={self.initial_stop_price:.3f}",
+                    level="WARN",
+                )
+                return None
 
             if snapshot.active_stop_order:
                 current_sl = snapshot.active_stop_order.auxPrice
-
+            if current_sl is None:
+                return None
             if current_price <= 100.00:
                 buf = 0.02
             elif current_price > 100.00 and current_price <= 200.00:
@@ -3787,6 +4670,15 @@ class TradingContext:
                 buf = 0.09
             else:
                 buf = 0.10
+            # 新仓 / 换方向 / 成本变化时，重置 anchor
+            if (
+                self.tp1_trail_side != side
+                or self.tp1_trail_cost is None
+                or abs(self.tp1_trail_cost - cost) > 1e-6
+            ):
+                self.tp1_trail_anchor = None
+                self.tp1_trail_side = side
+                self.tp1_trail_cost = cost
 
             if side == "LONG":
                 breakeven = round(cost + buf, 2)
@@ -3811,15 +4703,15 @@ class TradingContext:
             else:
                 bounce = current_sl
 
-            if self.low_of_4min > 0:
-                low_of_4min = self.low_of_4min
+            if self.low_of_6min > 0:
+                low_of_6min = self.low_of_6min
             else:
-                low_of_4min = current_sl
+                low_of_6min = current_sl
 
-            if self.high_of_4min > 0:
-                high_of_4min = self.high_of_4min
+            if self.high_of_6min > 0:
+                high_of_6min = self.high_of_6min
             else:
-                high_of_4min = current_sl
+                high_of_6min = current_sl
 
             if self.holding_start_time > 0:
                 elapsed = int(time_module.time() - self.holding_start_time)
@@ -3827,203 +4719,341 @@ class TradingContext:
                 elapsed = int(0)
 
             if side == "LONG":
-                # 1. 先检查 当前价格current_price是否 涨过了r1价格线
-                if current_price < r1:
-                    if elapsed <= 240:  # 持仓没有超过4分钟，保持现有止损价格不动
-                        self.last_stop_cond = self.current_stop_cond
-                        self.current_stop_cond = "L1"
-                        if self.current_stop_cond != self.last_stop_cond:
-                            self.sys_log(
-                                f"🔍 [_trailing_stop 保本] breakeven={breakeven:.3f} | "
-                                f"buf={buf:.3f} | 盈利幅度={breakeven - current_price if side == 'SHORT' else current_price - breakeven:.3f}",
-                                level="DEBUG",
-                            )
-                            self.sys_log(
-                                f"🧭 [追踪止损L1] 持仓时间={elapsed},不调整止损价 ",
-                                level="DEBUG",
-                            )
-                        return None
-                    elif elapsed > 240 and current_price <= round(
-                        cost + 0.5 * r, 2
-                    ):  # 持仓超过4分钟，但是浮动盈利还没有超过0.5*R
-                        self.last_stop_cond = self.current_stop_cond
-                        self.current_stop_cond = "L2"
-                        if self.current_stop_cond != self.last_stop_cond:
-                            self.sys_log(
-                                f"🔍 [_trailing_stop 保本] breakeven={breakeven:.3f} | "
-                                f"buf={buf:.3f} | 盈利幅度={breakeven - current_price if side == 'SHORT' else current_price - breakeven:.3f}",
-                                level="DEBUG",
-                            )
-                            self.sys_log(
-                                f"🧭 [追踪止损L2] 持仓时间{elapsed}秒, 浮动盈利还没有超过0.5*R{round(0.5*r,2)},主动平仓离场",
-                                level="DEBUG",
-                            )
-                            await self.clear_pos(snapshot)
-                        return None
-                    else:  # 持仓时间超过 4min，而且浮动盈利在 0.5R和 1R之间，保持静默
-                        self.last_stop_cond = self.current_stop_cond
-                        self.current_stop_cond = "L3"
-                        if self.current_stop_cond != self.last_stop_cond:
-                            self.sys_log(
-                                f"🔍 [_trailing_stop 保本] breakeven={breakeven:.3f} | "
-                                f"buf={buf:.3f} | 盈利幅度={breakeven - current_price if side == 'SHORT' else current_price - breakeven:.3f}",
-                                level="DEBUG",
-                            )
-                            self.sys_log(
-                                f"🧭 [追踪止损L3] 持仓时间{elapsed}, 浮动盈利<1R 但是 >0.5R,止损价格不动",
-                                level="DEBUG",
-                            )
-                        return None
+                # -----------------------------------------------------
+                # 新增分支：TP1 已事实成交 -> 方案A
+                # 说明：这是新增的 L9 / L10，不动原 L1-L8
+                # -----------------------------------------------------
+                if self.tp1_filled:
 
-                elif current_price >= r1 and current_price < round(cost + 1.5 * r, 2):
-                    # current_price >= r1 但是还没到 TP1, 已经大幅盈利了
-                    new_sl = max(current_sl, low_of_4min)
-                    if new_sl >= current_sl + 0.05:
-                        self.last_stop_cond = self.current_stop_cond
-                        self.current_stop_cond = "L4"
-                        self.sys_log(
-                            f"🧭 [追踪止损L4]准备把止损价从{current_sl:.2f} 抬升到{new_sl:.2f}，当前市价{current_price:.2f}",
-                            level="DEBUG",
-                        )
-                        return new_sl
-
+                    if self.tp1_trail_anchor is None:
+                        self.tp1_trail_anchor = current_price
                     else:
+                        self.tp1_trail_anchor = max(
+                            self.tp1_trail_anchor, current_price
+                        )
+
+                    k = 1.5
+                    candidate_sl = round(self.tp1_trail_anchor - k * atr, 2)
+
+                    # 防守：LONG 止损不能推到当前价之上
+                    if candidate_sl >= current_price:
                         self.last_stop_cond = self.current_stop_cond
-                        self.current_stop_cond = "L5"
+                        self.current_stop_cond = "L9"
                         if self.current_stop_cond != self.last_stop_cond:
                             self.sys_log(
-                                f"🧭 [追踪止损L5]当前止损价{current_sl:.2f},暂时不调整,当前市价{current_price:.2f}",
+                                f"🧭 [追踪止损L9] TP1后方案A候选止损价格无效 | "
+                                f"anchor={self.tp1_trail_anchor:.2f} | "
+                                f"candidate_sl={candidate_sl:.2f} >= current_price={current_price:.2f}，暂不调整",
                                 level="DEBUG",
                             )
                         return None
-                elif current_price >= round(cost + 1.5 * r, 2):  # 当前价格已经在TP1之上
-                    new_sl = max(current_sl, breakeven, dip)
+
+                    # LONG 止损只能抬高，不能倒退
+                    new_sl = max(current_sl, breakeven, candidate_sl)
+
                     if new_sl >= current_sl + 0.05:
                         self.last_stop_cond = self.current_stop_cond
-                        self.current_stop_cond = "L6"
+                        self.current_stop_cond = "L10"
                         self.sys_log(
-                            f"🧭 [追踪止损L6]准备把止损价从{current_sl:.2f} 抬升到{new_sl:.2f}，保本价={breakeven:.2f}",
+                            f"🧭 [追踪止损L10] TP1已成交，方案A生效 | "
+                            f"anchor={self.tp1_trail_anchor:.2f} | "
+                            f"k={k:.2f}R | candidate_sl={candidate_sl:.2f} | "
+                            f"止损价从{current_sl:.2f} 抬升到{new_sl:.2f}",
                             level="DEBUG",
                         )
                         return new_sl
                     else:
                         self.last_stop_cond = self.current_stop_cond
-                        self.current_stop_cond = "L7"
+                        self.current_stop_cond = "L11"
                         if self.current_stop_cond != self.last_stop_cond:
                             self.sys_log(
-                                f"🧭 [追踪止损L7]当前止损价{current_sl:.2f},暂时不调整",
+                                f"🧭 [追踪止损L11] TP1已成交，方案A暂不调整 | "
+                                f"anchor={self.tp1_trail_anchor:.2f} | "
+                                f"candidate_sl={candidate_sl:.2f} | 当前止损价{current_sl:.2f}",
                                 level="DEBUG",
                             )
                         return None
-                else:  # 应该永远不会到这个分支
-                    self.last_stop_cond = self.current_stop_cond
-                    self.current_stop_cond = "L8"
-                    if self.current_stop_cond != self.last_stop_cond:
-                        self.sys_log(
-                            f"🧭 [追踪止损L8]当前止损价{current_sl:.2f},当前市价{current_price:.2f},逻辑判断出现问题，请检查程序",
-                            level="DEBUG",
-                        )
-                    return None
+
+                # -----------------------------------------------------
+                # 原结构完全保留：tp1_filled == False 时，走原 L1-L8
+                # -----------------------------------------------------
+                else:
+                    # TP1 未成交时，清空 anchor，避免污染下一阶段
+                    self.tp1_trail_anchor = None
+                    # 1. 先检查 当前价格current_price是否 涨过了r1价格线
+                    if current_price < r1:
+                        if (
+                            elapsed <= 60 * 15
+                        ):  # 持仓没有超过15分钟，保持现有止损价格不动
+                            self.last_stop_cond = self.current_stop_cond
+                            self.current_stop_cond = "L1"
+                            if self.current_stop_cond != self.last_stop_cond:
+                                self.sys_log(
+                                    f"🔍 [_trailing_stop 保本] breakeven={breakeven:.3f} | "
+                                    f"buf={buf:.3f} | 盈利幅度={breakeven - current_price if side == 'SHORT' else current_price - breakeven:.3f}",
+                                    level="DEBUG",
+                                )
+                                self.sys_log(
+                                    f"🧭 [追踪止损L1] 持仓时间={elapsed},不调整止损价 ",
+                                    level="DEBUG",
+                                )
+                            return None
+                        elif elapsed > 60 * 15 and current_price <= round(
+                            cost + 0.5 * r, 2
+                        ):  # 持仓超过15分钟，但是浮动盈利还没有超过0.5*R
+                            self.last_stop_cond = self.current_stop_cond
+                            self.current_stop_cond = "L2"
+                            new_sl = max(current_sl, low_of_6min, current_price - atr)
+                            if self.current_stop_cond != self.last_stop_cond:
+                                self.sys_log(
+                                    f"🔍 [_trailing_stop 保本] breakeven={breakeven:.3f} | "
+                                    f"buf={buf:.3f} | 盈利幅度={breakeven - current_price if side == 'SHORT' else current_price - breakeven:.3f}",
+                                    level="DEBUG",
+                                )
+                                self.sys_log(
+                                    f"🧭 [追踪止损L2] 持仓时间{elapsed}秒, 准备把把止损价格调整到保本{new_sl:.3f}",
+                                    level="DEBUG",
+                                )
+                                # await self.clear_pos(snapshot)
+                            return new_sl
+                        else:  # 持仓时间超过 15min，而且浮动盈利在 0.5R和 1R之间
+                            self.last_stop_cond = self.current_stop_cond
+                            self.current_stop_cond = "L3"
+                            new_sl = max(current_sl, current_price - atr, low_of_6min)
+                            if self.current_stop_cond != self.last_stop_cond:
+                                self.sys_log(
+                                    f"🔍 [_trailing_stop 保本] breakeven={breakeven:.3f} | "
+                                    f"buf={buf:.3f} | 盈利幅度={breakeven - current_price if side == 'SHORT' else current_price - breakeven:.3f}",
+                                    level="DEBUG",
+                                )
+                                self.sys_log(
+                                    f"🧭 [追踪止损L3] 持仓时间{elapsed}, 浮动盈利<1R 但是 >0.5R,止损价格准备调整到{new_sl:.3f}",
+                                    level="DEBUG",
+                                )
+                            return new_sl
+
+                    elif current_price >= r1 and current_price < round(
+                        cost + 1.5 * r, 2
+                    ):
+                        # current_price >= r1 已经大幅盈利了
+                        new_sl = max(current_sl, low_of_6min)
+                        if new_sl >= current_sl + 0.05:
+                            self.last_stop_cond = self.current_stop_cond
+                            self.current_stop_cond = "L4"
+                            self.sys_log(
+                                f"🧭 [追踪止损L4]准备把止损价从{current_sl:.2f} 抬升到{new_sl:.2f}，当前市价{current_price:.2f}",
+                                level="DEBUG",
+                            )
+                            return new_sl
+
+                        else:
+                            self.last_stop_cond = self.current_stop_cond
+                            self.current_stop_cond = "L5"
+                            if self.current_stop_cond != self.last_stop_cond:
+                                self.sys_log(
+                                    f"🧭 [追踪止损L5]当前止损价{current_sl:.2f},暂时不调整,当前市价{current_price:.2f}",
+                                    level="DEBUG",
+                                )
+                            return None
+                    elif current_price >= round(
+                        cost + 1.5 * r, 2
+                    ):  # 当前价格已经在1.5*R 之上
+                        new_sl = max(current_sl, breakeven, dip)
+                        if new_sl >= current_sl + 0.05:
+                            self.last_stop_cond = self.current_stop_cond
+                            self.current_stop_cond = "L6"
+                            self.sys_log(
+                                f"🧭 [追踪止损L6]准备把止损价从{current_sl:.2f} 抬升到{new_sl:.2f}，保本价={breakeven:.2f}",
+                                level="DEBUG",
+                            )
+                            return new_sl
+                        else:
+                            self.last_stop_cond = self.current_stop_cond
+                            self.current_stop_cond = "L7"
+                            if self.current_stop_cond != self.last_stop_cond:
+                                self.sys_log(
+                                    f"🧭 [追踪止损L7]当前止损价{current_sl:.2f},暂时不调整",
+                                    level="DEBUG",
+                                )
+                            return None
+                    else:  # 应该永远不会到这个分支
+                        self.last_stop_cond = self.current_stop_cond
+                        self.current_stop_cond = "L8"
+                        if self.current_stop_cond != self.last_stop_cond:
+                            self.sys_log(
+                                f"🧭 [追踪止损L8]当前止损价{current_sl:.2f},当前市价{current_price:.2f},逻辑判断出现问题，请检查程序",
+                                level="DEBUG",
+                            )
+                        return None
 
             # === 做空场景（对称逻辑）===
             elif side == "SHORT":
-                # 1. 先检查 当前价格current_price是否下跌低于了r1价格线
-                if current_price > r1:
-                    if elapsed <= 240:  # 持仓没有超过4分钟，保持现有止损价格不动
-                        self.last_stop_cond = self.current_stop_cond
-                        self.current_stop_cond = "S1"
-                        if self.current_stop_cond != self.last_stop_cond:
-                            self.sys_log(
-                                f"🔍 [_trailing_stop 保本] breakeven={breakeven:.3f} | "
-                                f"buf={buf:.3f} | 盈利幅度={breakeven - current_price if side == 'SHORT' else current_price - breakeven:.3f}",
-                                level="DEBUG",
-                            )
-                            self.sys_log(
-                                f"🧭 [追踪止损S1] 持仓时间={elapsed},不调整止损价 ",
-                                level="DEBUG",
-                            )
-                        return None
-                    elif elapsed > 240 and current_price >= round(
-                        cost - 0.5 * r, 2
-                    ):  # 持仓超过4分钟，但是浮动盈利还没有超过0.5*R
-                        self.last_stop_cond = self.current_stop_cond
-                        self.current_stop_cond = "S2"
-                        if self.current_stop_cond != self.last_stop_cond:
-                            self.sys_log(
-                                f"🔍 [_trailing_stop 保本] breakeven={breakeven:.3f} | "
-                                f"buf={buf:.3f} | 盈利幅度={breakeven - current_price if side == 'SHORT' else current_price - breakeven:.3f}",
-                                level="DEBUG",
-                            )
-                            self.sys_log(
-                                f"🧭 [追踪止损S2] 持仓时间{elapsed}秒, 浮动盈利还没有超过0.5*R{round(0.5*r,2)},主动平仓离场",
-                                level="DEBUG",
-                            )
-                            await self.clear_pos(snapshot)
-                        return None
-                    else:  # 持仓时间超过 4min，而且浮动盈利在 0.5R和 1R之间，保持静默
-                        self.last_stop_cond = self.current_stop_cond
-                        self.current_stop_cond = "S3"
-                        if self.current_stop_cond != self.last_stop_cond:
-                            self.sys_log(
-                                f"🔍 [_trailing_stop 保本] breakeven={breakeven:.3f} | "
-                                f"buf={buf:.3f} | 盈利幅度={breakeven - current_price if side == 'SHORT' else current_price - breakeven:.3f}",
-                                level="DEBUG",
-                            )
-                            self.sys_log(
-                                f"🧭 [追踪止损S3] 持仓时间{elapsed}, 浮动盈利<1R 但是 >0.5R,止损价格不动",
-                                level="DEBUG",
-                            )
-                        return None
+                # -----------------------------------------------------
+                # 新增分支：TP1 已事实成交 -> 方案A
+                # 说明：这是新增的 S9 / S10，不动原 S1-S8
+                # -----------------------------------------------------
+                if self.tp1_filled:
 
-                elif current_price <= r1 and current_price > round(cost - 1.5 * r, 2):
-                    # current_price <= r1 但是还没到 TP1, 已经大幅盈利了
-                    new_sl = min(current_sl, high_of_4min)
-                    if new_sl <= current_sl - 0.05:
-                        self.last_stop_cond = self.current_stop_cond
-                        self.current_stop_cond = "S4"
-                        self.sys_log(
-                            f"🧭 [追踪止损S4]准备把止损价从{current_sl:.2f} 下降到{new_sl:.2f}，当前市价{current_price:.2f}",
-                            level="DEBUG",
-                        )
-                        return new_sl
-
+                    if self.tp1_trail_anchor is None:
+                        self.tp1_trail_anchor = current_price
                     else:
+                        self.tp1_trail_anchor = min(
+                            self.tp1_trail_anchor, current_price
+                        )
+
+                    k = 1.5
+                    candidate_sl = round(self.tp1_trail_anchor + k * atr, 2)
+
+                    # 防守：SHORT 止损不能推到当前价之下
+                    if candidate_sl <= current_price:
                         self.last_stop_cond = self.current_stop_cond
-                        self.current_stop_cond = "S5"
+                        self.current_stop_cond = "S9"
                         if self.current_stop_cond != self.last_stop_cond:
                             self.sys_log(
-                                f"🧭 [追踪止损S5]当前止损价{current_sl:.2f},暂时不调整,当前市价{current_price:.2f}",
+                                f"🧭 [追踪止损S9] TP1后方案A候选止损无效 | "
+                                f"anchor={self.tp1_trail_anchor:.2f} | "
+                                f"candidate_sl={candidate_sl:.2f} <= current_price={current_price:.2f}，暂不调整",
                                 level="DEBUG",
                             )
                         return None
-                elif current_price <= round(cost - 1.5 * r, 2):  # 当前价格已经在TP1之下
-                    new_sl = min(current_sl, breakeven, bounce)
+
+                    # SHORT 止损只能下降，不能倒退
+                    new_sl = min(current_sl, breakeven, candidate_sl)
+
                     if new_sl <= current_sl - 0.05:
                         self.last_stop_cond = self.current_stop_cond
-                        self.current_stop_cond = "S6"
+                        self.current_stop_cond = "S10"
                         self.sys_log(
-                            f"🧭 [追踪止损S6]准备把止损价从{current_sl:.2f} 下降到{new_sl:.2f}，保本价={breakeven:.2f}",
+                            f"🧭 [追踪止损S10] TP1已成交，方案A生效 | "
+                            f"anchor={self.tp1_trail_anchor:.2f} | "
+                            f"k={k:.2f}R | candidate_sl={candidate_sl:.2f} | "
+                            f"止损价从{current_sl:.2f} 下降到{new_sl:.2f}",
                             level="DEBUG",
                         )
                         return new_sl
                     else:
                         self.last_stop_cond = self.current_stop_cond
-                        self.current_stop_cond = "S7"
+                        self.current_stop_cond = "S11"
                         if self.current_stop_cond != self.last_stop_cond:
                             self.sys_log(
-                                f"🧭 [追踪止损S7]当前止损价{current_sl:.2f},暂时不调整",
+                                f"🧭 [追踪止损S11] TP1已成交，方案A暂不调整 | "
+                                f"anchor={self.tp1_trail_anchor:.2f} | "
+                                f"candidate_sl={candidate_sl:.2f} | 当前止损价{current_sl:.2f}",
                                 level="DEBUG",
                             )
                         return None
-                else:  # 应该永远不会到这个分支
-                    self.last_stop_cond = self.current_stop_cond
-                    self.current_stop_cond = "S8"
-                    if self.current_stop_cond != self.last_stop_cond:
-                        self.sys_log(
-                            f"🧭 [追踪止损S8]当前止损价{current_sl:.2f},当前市价{current_price:.2f},逻辑判断出现问题，请检查程序",
-                            level="DEBUG",
-                        )
-                    return None
+
+                # -----------------------------------------------------
+                # 原结构完全保留：tp1_filled == False 时，走原 S1-S8
+                # -----------------------------------------------------
+                else:
+                    # TP1 未成交时，清空 anchor，避免污染下一阶段
+                    self.tp1_trail_anchor = None
+                    # 1. 先检查 当前价格current_price是否下跌低于了r1价格线
+                    if current_price > r1:
+                        if (
+                            elapsed <= 60 * 15
+                        ):  # 持仓没有超过15分钟，保持现有止损价格不动
+                            self.last_stop_cond = self.current_stop_cond
+                            self.current_stop_cond = "S1"
+                            if self.current_stop_cond != self.last_stop_cond:
+                                self.sys_log(
+                                    f"🔍 [_trailing_stop 保本] breakeven={breakeven:.3f} | "
+                                    f"buf={buf:.3f} | 盈利幅度={breakeven - current_price if side == 'SHORT' else current_price - breakeven:.3f}",
+                                    level="DEBUG",
+                                )
+                                self.sys_log(
+                                    f"🧭 [追踪止损S1] 持仓时间={elapsed},不调整止损价 ",
+                                    level="DEBUG",
+                                )
+                            return None
+                        elif elapsed > 60 * 15 and current_price >= round(
+                            cost - 0.5 * r, 2
+                        ):  # 持仓超过15分钟，但是浮动盈利还没有超过0.5*R
+                            self.last_stop_cond = self.current_stop_cond
+                            self.current_stop_cond = "S2"
+                            new_sl = min(current_sl, current_price + atr, high_of_6min)
+                            if self.current_stop_cond != self.last_stop_cond:
+                                self.sys_log(
+                                    f"🔍 [_trailing_stop 保本] breakeven={breakeven:.3f} | "
+                                    f"buf={buf:.3f} | 盈利幅度={breakeven - current_price if side == 'SHORT' else current_price - breakeven:.3f}",
+                                    level="DEBUG",
+                                )
+                                self.sys_log(
+                                    f"🧭 [追踪止损S2] 持仓时间{elapsed}秒, 准备把把止损价格调整到保本{new_sl:.3f}",
+                                    level="DEBUG",
+                                )
+                                # await self.clear_pos(snapshot)
+                            return new_sl
+                        else:  # 持仓时间超过 15min，而且浮动盈利在 0.5R和 1R之间，保持静默
+                            self.last_stop_cond = self.current_stop_cond
+                            self.current_stop_cond = "S3"
+                            new_sl = min(current_sl, high_of_6min, current_price + atr)
+                            if self.current_stop_cond != self.last_stop_cond:
+                                self.sys_log(
+                                    f"🔍 [_trailing_stop 保本] breakeven={breakeven:.3f} | "
+                                    f"buf={buf:.3f} | 盈利幅度={breakeven - current_price if side == 'SHORT' else current_price - breakeven:.3f}",
+                                    level="DEBUG",
+                                )
+                                self.sys_log(
+                                    f"🧭 [追踪止损S3] 持仓时间{elapsed}, 浮动盈利<1R 但是 >0.5R,把止损价格调整到{new_sl:.3f}",
+                                    level="DEBUG",
+                                )
+                            return new_sl
+
+                    elif current_price <= r1 and current_price > round(
+                        cost - 1.5 * r, 2
+                    ):
+                        # current_price <= r1 但是还没到 TP1, 已经大幅盈利了
+                        new_sl = min(current_sl, high_of_6min)
+                        if new_sl <= current_sl - 0.05:
+                            self.last_stop_cond = self.current_stop_cond
+                            self.current_stop_cond = "S4"
+                            self.sys_log(
+                                f"🧭 [追踪止损S4]准备把止损价从{current_sl:.2f} 下降到{new_sl:.2f}，当前市价{current_price:.2f}",
+                                level="DEBUG",
+                            )
+                            return new_sl
+
+                        else:
+                            self.last_stop_cond = self.current_stop_cond
+                            self.current_stop_cond = "S5"
+                            if self.current_stop_cond != self.last_stop_cond:
+                                self.sys_log(
+                                    f"🧭 [追踪止损S5]当前止损价{current_sl:.2f},暂时不调整,当前市价{current_price:.2f}",
+                                    level="DEBUG",
+                                )
+                            return None
+                    elif current_price <= round(
+                        cost - 1.5 * r, 2
+                    ):  # 当前价格已经在1.5*R之下
+                        new_sl = min(current_sl, breakeven, bounce)
+                        if new_sl <= current_sl - 0.05:
+                            self.last_stop_cond = self.current_stop_cond
+                            self.current_stop_cond = "S6"
+                            self.sys_log(
+                                f"🧭 [追踪止损S6]准备把止损价从{current_sl:.2f} 下降到{new_sl:.2f}，保本价={breakeven:.2f}",
+                                level="DEBUG",
+                            )
+                            return new_sl
+                        else:
+                            self.last_stop_cond = self.current_stop_cond
+                            self.current_stop_cond = "S7"
+                            if self.current_stop_cond != self.last_stop_cond:
+                                self.sys_log(
+                                    f"🧭 [追踪止损S7]当前止损价{current_sl:.2f},暂时不调整",
+                                    level="DEBUG",
+                                )
+                            return None
+                    else:  # 应该永远不会到这个分支
+                        self.last_stop_cond = self.current_stop_cond
+                        self.current_stop_cond = "S8"
+                        if self.current_stop_cond != self.last_stop_cond:
+                            self.sys_log(
+                                f"🧭 [追踪止损S8]当前止损价{current_sl:.2f},当前市价{current_price:.2f},逻辑判断出现问题，请检查程序",
+                                level="DEBUG",
+                            )
+                        return None
 
             else:
                 # === 异常情况 ===
@@ -4260,13 +5290,13 @@ class TradingContext:
                 )
 
             trade = self.ib.placeOrder(self.contract, m_order)
-            self.filled_flag = True
-
+            oid = getattr(trade.order, "orderId", 0)
             self.sys_log(
-                f"📉 [TP1止盈单] 提交给TWS-{action}-{final_qty}股，Ref={m_order.orderRef} | "
+                f"📉 [TP1止盈单] 提交oid{oid} {action}-{final_qty}股，Ref={m_order.orderRef} | "
                 f"剩余可平余量:{available_to_close - final_qty}",
                 level="DECISION",
             )
+            self.filled_flag = True
             return trade
 
         except Exception as e:
@@ -4324,7 +5354,7 @@ class TradingContext:
 
             target_price = self.tp1
 
-            tp_buffer = max(self.effective_atr * 0.5, 0.05)
+            tp_buffer = min(max(self.effective_atr * 0.25, 0.03), 0.10)
             if snapshot.direction == "LONG":
                 is_hit = curr_high >= target_price - tp_buffer
             else:
@@ -4571,7 +5601,7 @@ class TradingContext:
                 order_ref = getattr(t.order, "orderRef", "")
                 if order_ref.startswith("CL_"):
                     self.sys_log(
-                        f"⏭️ [清仓拦截] 已有活跃平仓单 Ref:{order_ref}，跳过本次强制清仓",
+                        f"⏭️ [清仓拦截] 已有平仓单 Ref:{order_ref}，跳过本次强制清仓",
                         level="INFO",
                     )
                     return
@@ -4731,285 +5761,6 @@ class TradingContext:
                 level="WARN",
             )
 
-    def _chase_order(self, snapshot: ContextSnapshot):
-        """
-        [治理层] 动能单追单公共函数 (同步修复版)
-        核心改进：
-        1. 保持同步函数签名 (def 而非 async def)
-        2. 使用 ib.waitOnUpdate() 泵送消息队列
-        3. 增加订单修改后的服务器确认步骤
-        """
-        # === 阶段 1：方向判定 ===
-        if not snapshot.entry_orders:
-            self.sys_log(
-                "❌ [_chase_order] 无入场订单，无法判定交易方向", level="ERROR"
-            )
-            return False
-
-        p_order = snapshot.entry_orders[0]
-        is_buy = p_order.action == "BUY"
-        side_str = "LONG" if is_buy else "SHORT"
-
-        # === 阶段 2：主订单定位与状态预检 ===
-        p_target_id = snapshot.main_order_id
-        if not p_target_id:
-            self.sys_log("❌ [_chase_order] 审计指纹缺失 order_id", level="ERROR")
-            return False
-
-        # 获取实时订单对象
-        live_trades = self.ib.trades()
-        live_trade = next(
-            (t for t in live_trades if t.order.orderId == p_target_id), None
-        )
-
-        if not live_trade:
-            self.sys_log(
-                f"⚠️ [_chase_order] 无法找到活跃订单 OID:{p_target_id}", level="WARN"
-            )
-            return False
-
-        # 再次确认订单状态
-        if live_trade.orderStatus.status in [
-            "Filled",
-            "Cancelled",
-            "Inactive",
-            "PendingCancel",
-        ]:
-            self.sys_log(
-                f"⚠️ [_chase_order] 订单已不可修改：{live_trade.orderStatus.status}",
-                level="WARN",
-            )
-            return False
-
-        if live_trade.orderStatus.status == "PartiallyFilled":
-            self.sys_log(
-                f"⚠️ [_chase_order] 订单已部分成交，跳过追单 | "
-                f"已成交:{live_trade.orderStatus.filled} / 总量:{live_trade.order.totalQuantity}",
-                level="WARN",
-            )
-            return False
-
-        if live_trade.orderStatus.remaining <= 0:
-            self.sys_log(f"⚠️ [_chase_order] 订单剩余数量为 0", level="WARN")
-            return False
-
-        # === 阶段 3：获取实时对手价 (关键修复) ===
-        opp_price = None
-        self.ib.reqMktData(self.contract, "", False, False)
-
-        # ✅ 关键修复：使用 waitOnUpdate 让事件循环处理网络消息
-        start_t = time_module.time()
-        while time_module.time() - start_t < 2.0:
-            ticker = self.ib.ticker(self.contract)
-            # self.ib.waitOnUpdate(timeout=0.1)  # 等待 0.1 秒让 ticker 更新
-            if ticker and ticker.ask > 0 and ticker.bid > 0:
-                opp_price = ticker.ask if is_buy else ticker.bid
-                self.sys_log(
-                    f"🔍 [追单 - 查询 ticker] ask={ticker.ask:.3f} | bid={ticker.bid:.3f} | 耗时={round(time_module.time() - start_t, 2)}s",
-                    level="DEBUG",
-                )
-                break
-
-        self.ib.cancelMktData(self.contract)
-
-        if opp_price is None:
-            self.sys_log("❌ [_chase_order] 无法获取有效行情，放弃追单", level="ERROR")
-            return False
-
-        # === 阶段 4：价格计算 ===
-        orig_p_lmt = live_trade.order.lmtPrice
-        # 激进穿透：买 +0.08, 卖 -0.08
-        new_p_lmt = round(opp_price + 0.08, 2) if is_buy else round(opp_price - 0.08, 2)
-
-        # 常识检查
-        if (is_buy and new_p_lmt <= orig_p_lmt) or (
-            not is_buy and new_p_lmt >= orig_p_lmt
-        ):
-            self.sys_log(f"⚡ [追单拦截] 新价格{new_p_lmt} 无优势，跳过", level="DEBUG")
-            return False
-
-        # === 阶段 5：执行修改 ===
-        old_price = live_trade.order.lmtPrice
-        live_trade.order.lmtPrice = new_p_lmt
-
-        try:
-            # 提交修改
-            self.ib.placeOrder(live_trade.contract, live_trade.order)
-
-            # ✅ 关键修复：等待服务器确认修改成功
-            verify_start = time_module.time()
-            modified_success = False
-
-            while time_module.time() - verify_start < 3.0:
-                self.ib.waitOnUpdate(timeout=0.2)
-                # 刷新本地 trade 对象状态
-                current_trades = self.ib.trades()
-                current_trade = next(
-                    (t for t in current_trades if t.order.orderId == p_target_id), None
-                )
-
-                if not current_trade:
-                    break
-
-                # 检查价格是否真的变了
-                if current_trade.order.lmtPrice == new_p_lmt:
-                    modified_success = True
-                    break
-                # 检查是否被拒
-                if current_trade.orderStatus.status in [
-                    "Inactive",
-                    "Cancelled",
-                    "PendingCancel",
-                ]:
-                    self.sys_log(
-                        f"❌ [追单被拒] 订单状态变为 {current_trade.orderStatus.status}",
-                        level="ERROR",
-                    )
-                    return False
-
-            if not modified_success:
-                self.sys_log(
-                    f"❌ [追单失败] 3 秒内未确认价格变更，可能服务器拒绝", level="ERROR"
-                )
-                return False
-
-            self.sys_log(
-                f"✅ [追单确认成功] OID:{p_target_id} | {old_price} → {new_p_lmt} | 对手价:{opp_price:.2f}",
-                level="INFO",
-            )
-            return True
-
-        except Exception as e:
-            self.sys_log(f"❌ [追单异常] {e}", level="ERROR")
-            self.sys_log(f".StackTrace:\n{traceback.format_exc()}", level="DEBUG")
-            return False
-
-    def _chase_order_old(self, snapshot: ContextSnapshot):
-        """
-        [治理层] 动能单追单公共函数
-        职责：执行激进价格追单 + 止损单风险间隙守恒同步
-        适用场景：cond_06_02 (入场追单) / cond_08_02 (开仓追单)
-
-        核心原则：方向判定基于物理订单事实 (order.action)，而非字符串猜测 (label)
-        """
-        # === 阶段1：方向判定（基于物理订单事实）===
-        if not snapshot.entry_orders:
-            self.sys_log(
-                "❌ [_chase_order] 无入场订单，无法判定交易方向", level="ERROR"
-            )
-            return False
-
-        # ✅ 黄金标准：直接读取订单的 action 字段（BUY/SELL）
-        p_order = snapshot.entry_orders[0]  # 第一个入场单即主单
-        is_buy = p_order.action == "BUY"
-        side_str = "LONG" if is_buy else "SHORT"
-
-        # === 阶段2：主订单定位 ===
-        p_target_id = snapshot.main_order_id
-        if not p_target_id:
-            self.sys_log("❌ [_chase_order] 审计指纹缺失 order_id", level="ERROR")
-            return False
-
-        # 🔥 从 IBKR 实时获取最新订单，而非使用快照
-        live_trades = self.ib.trades()
-        live_trade = next(
-            (t for t in live_trades if t.order.orderId == p_target_id), None
-        )
-        if not live_trade:
-            order_ids = [t.order.orderId for t in live_trades]
-            self.sys_log(
-                f"⚠️ [_chase_order] 无法从 IBKR 获取实时订单 OID:{p_target_id} | 活跃订单：{order_ids}",
-                level="ERROR",
-            )
-            return False
-        # 🔥 订单状态检查（尽早排除不可修改的订单）
-        order_status = live_trade.orderStatus.status
-        remaining = live_trade.orderStatus.remaining
-        if (
-            order_status in ["Filled", "Cancelled", "Inactive", "PendingCancel"]
-            or remaining <= 0
-        ):
-            self.sys_log(
-                f"⚠️ [_chase_order] 订单状态{order_status} 或剩余{remaining}，不可修改",
-                level="WARN",
-            )
-            return False
-
-        # === 阶段3：通过IBKR读取最新一个ticker，找对手价 ===
-        opp_price = None
-        self.live_ticker = self.ib.reqMktData(self.contract, "", False, False)
-        # 等待指定时间，或直到有数据
-        start_t = time_module.time()
-        while time_module.time() - start_t < 2:
-
-            ticker = self.live_ticker
-            if ticker and ticker.ask > 0 and ticker.bid > 0:
-                opp_price = ticker.ask if is_buy else ticker.bid
-                self.sys_log(
-                    f"🔍 [追单-查询ticker] ticker.ask={ticker.ask:.3f} | ticker.bid={ticker.bid:.3f}|"
-                    f"ticker.last={ticker.last:.3f} | ticker.close={ticker.close:.3f}"
-                    f"查询等待时间 = {round(time_module.time() - start_t,2)}",
-                    level="DEBUG",
-                )
-                break
-        if ticker is None:
-            self.sys_log("❌ [_chase_order] live_ticker无法获取行情", level="ERROR")
-            return False
-        self.ib.cancelMktData(self.contract)
-        self.live_ticker = None
-
-        # === 阶段4：价格穿透调优 ===
-        orig_p_lmt = live_trade.order.lmtPrice
-
-        # 价格穿透：对手价 + 0.05 缓冲区（确保吃掉盘口厚度）
-        new_p_lmt = round(opp_price + 0.08, 2) if is_buy else round(opp_price - 0.08, 2)
-
-        # ==== 阶段5： 检查计算出的追单价格是否符合常识，不符合就跳过本次追单
-        if is_buy and new_p_lmt <= orig_p_lmt:
-            self.sys_log(
-                f"⚡ [追单拦截] 做多的追单价格{new_p_lmt:.2f}小于等于当前挂单价格{orig_p_lmt:.2f}，跳过本次追单",
-                level="DEBUG",
-            )
-            return False
-        elif not is_buy and new_p_lmt >= orig_p_lmt:
-            self.sys_log(
-                f"⚡ [追单拦截] 做空的追单价格{new_p_lmt:.2f}大于等于当前挂单价格{orig_p_lmt:.2f}，跳过本次追单",
-                level="DEBUG",
-            )
-            return False
-        # === 阶段6：主订单追单 ===
-        # 🔥 记录修改前价格（用于日志审计）
-        old_price = live_trade.order.lmtPrice
-        live_trade.order.lmtPrice = new_p_lmt
-
-        try:
-            # 🔥 提交修改（保持 orderId 不变，保持 Bracket 关系）
-            chase_trade = self.ib.placeOrder(live_trade.contract, live_trade.order)
-            self.sys_log(
-                f"✅ [追单提交] OID:{p_target_id} | "
-                f"原限价lmt:{old_price} → 新限价lmt:{new_p_lmt} | 对手价:{opp_price:.2f}",
-                level="INFO",
-            )
-
-        except Exception as e:
-            self.sys_log(
-                f"❌ [追单修改失败] OID:{p_target_id} | 错误:{e}",
-                level="ERROR",
-            )
-            self.sys_log(f".StackTrace:\n{traceback.format_exc()}", level="DEBUG")
-            return False
-
-        # === 阶段7：审计指纹更新 ===
-        self._temp_order_audit.update({"last_p_lmt": new_p_lmt})
-
-        # === 阶段8：成功日志 ===
-        self.sys_log(
-            f"⚡ [追单提交TWS] {side_str} |对手价:{opp_price:.2f} → 订单新入场价:{new_p_lmt:.2f} | ",
-            level="WARN",
-        )
-
-        return True
-
     def _sync_position(self, snapshot: ContextSnapshot):
         """
         [大脑中枢] 矩阵式对账引擎 (全息日志版)
@@ -5019,6 +5770,11 @@ class TradingContext:
         # ======================================================================
         # --- 第 0 部分：解析基础的维度参数数据 ---
         # ======================================================================
+        # ✅ 新增：硬编码撤单阈值（简洁可靠）
+        WAIT_1_SEC = 10  # 第一等待区间（黄金撮合期）
+        WAIT_2_SEC = 25  # 第二等待区间（继续等待）
+        FORCE_CANCEL_SEC = 45  # 强制撤单时点
+
         # --- 0.0 基础对账维度提取 (雷达参数) ---
         self.last_cond = getattr(self, "current_cond", "Cond_01_IDLE")
         self.current_cond = "Cond_Unknown"
@@ -5067,26 +5823,6 @@ class TradingContext:
         else:
             p_f_elapsed = 0
 
-        # --- 0.2 策略性格识别与同步宽限期 (执法分级) ---
-        # 动能型信号特征：此类信号追求“破位即成交”，对排队容忍度极低 (10s)
-        # 🔥 新逻辑：从 orderRef 解析的 entry_type 判断（唯一真理源）
-        order_id = snapshot.main_order_id
-        label = snapshot.main_order_label or "Unknown"
-        entry_type = snapshot.main_order_entry_type or "Unknown"
-
-        # 基于 entry_type 判断订单性格
-        is_momentum = entry_type in ["Breakout"]  # 动能单
-        is_pullback = entry_type in ["GiftZone", "Pullback"]  # 回调单
-        is_reversal = entry_type in ["Reversal"]  # 🔥 新增：反转单
-        # 🔥 降级兼容：如果 entry_type 解析失败，用 label 兜底
-        # 降级兼容
-        if entry_type == "Unknown":
-            is_momentum = any(k in label for k in ["Elephant", "V180", "Law1", "Law8"])
-            is_pullback = any(k in label for k in ["Law#3", "Law3", "Pullback"])
-            is_reversal = any(
-                k in label for k in ["Reversal", "Law2", "Law6"]
-            )  # 🔥 新增
-
         # ========================================================================================
         # --- 第 1 部分：信号探测 (定义 意图/持仓/挂单 三个维度一共12个互斥象限，以及下面的二级分类) ---
         # =========================================================================================
@@ -5110,26 +5846,35 @@ class TradingContext:
         cond_06 = (
             intent == "ORDER_SENT" and not has_pos and has_orders
         )  # 意图:已下单， 无头寸，有在途订单   --- 正常入场挂单
+
+        # ✅ 重写：硬编码阈值 + 移除追单逻辑
         cond_06_01 = (
-            cond_06 and c_entry == 1 and elapsed <= 60 and not snapshot.has_partial_fill
-        )  # 主订单发出后的10秒等候成交时间
+            cond_06
+            and c_entry == 1
+            and elapsed <= WAIT_1_SEC
+            and not snapshot.has_partial_fill
+        )
         cond_06_02 = (
             cond_06
             and c_entry == 1
-            and elapsed > 60
-            and elapsed <= 90
+            and elapsed > WAIT_1_SEC
+            and elapsed <= WAIT_2_SEC
             and not snapshot.has_partial_fill
-        )  # 主订单发出后的25秒等候成交时间
+        )
         cond_06_03 = (
             cond_06
             and c_entry == 1
-            and elapsed > 90
-            and elapsed <= 120
+            and elapsed > WAIT_2_SEC
+            and elapsed <= FORCE_CANCEL_SEC
             and not snapshot.has_partial_fill
-        )  # 主订单发出后的 45秒等候成交时间
+        )
         cond_06_04 = (
-            cond_06 and c_entry == 1 and elapsed > 120 and not snapshot.has_partial_fill
-        )  # 主订单提交已经超过45秒未成交，撤单
+            cond_06
+            and c_entry == 1
+            and elapsed > FORCE_CANCEL_SEC
+            and not snapshot.has_partial_fill
+        )
+
         cond_06_partial = cond_06 and snapshot.has_partial_fill
         cond_06_05 = (
             cond_06 and c_entry > 1 and not snapshot.has_partial_fill
@@ -5160,14 +5905,16 @@ class TradingContext:
         cond_08_normal_push = cond_08 and c_entry > 0 and stop_qty > 0
 
         # 【关键优化】按时间阈值分层（与 cond_06 完全对齐）
-        cond_08_01 = cond_08_normal_push and elapsed <= 60  # 60秒黄金撮合期
+        # ✅ 重写：硬编码阈值 + 移除追单逻辑
+        cond_08_01 = cond_08_normal_push and elapsed <= WAIT_1_SEC
         cond_08_02 = (
-            cond_08_normal_push and elapsed > 60 and elapsed <= 90
-        )  # 10-25秒：动能单追单
+            cond_08_normal_push and elapsed > WAIT_1_SEC and elapsed <= WAIT_2_SEC
+        )
         cond_08_03 = (
-            cond_08_normal_push and elapsed > 90 and elapsed <= 120
-        )  # 25-45秒：回调单撤单
-        cond_08_04 = cond_08_normal_push and elapsed > 120  # >120秒：强制撤单
+            cond_08_normal_push and elapsed > WAIT_2_SEC and elapsed <= FORCE_CANCEL_SEC
+        )
+        cond_08_04 = cond_08_normal_push and elapsed > FORCE_CANCEL_SEC
+
         cond_08_partial = cond_08 and snapshot.has_partial_fill
 
         # --- 8-C: ⚖️ 成交纠偏：加仓单刚成交，进入股数对账期 ---
@@ -5248,7 +5995,7 @@ class TradingContext:
         if cond_01:
             self.current_cond = "cond_01"
             self.filled_flag = False
-            self.chase_flag = False
+
             # 稳态待机：不采取任何物理动作
         elif cond_02:
             self.current_cond = "cond_02"
@@ -5302,65 +6049,37 @@ class TradingContext:
                 self.current_cond = "cond_06_01"
                 if self.current_cond != self.last_cond:
                     self.sys_log(
-                        f"⏱️ [Cond_06_01] Entry_Type={entry_type}的订单提交{int(elapsed)}秒，耐心等待",
+                        f"⏱️ [Cond_06_01]订单提交{int(elapsed)}秒，耐心等待",
                         level="WARN",
                     )
                 self.filled_flag = False
 
             elif cond_06_02:
-                self.current_cond = "cond_06_02"  # 订单已经提交 >60秒 但是 <=90秒
-                if (
-                    is_momentum
-                ):  # 如果是动能单，就修改订单价格，激进入场。 不是动能单就继续等待。
-                    if not self.chase_flag:
-                        self.sys_log(
-                            f"⚡ [Cond_06_02] Entry_Type={entry_type}，动能订单提交已经{int(elapsed)}秒，改价格追单",
-                            level="WARN",
-                        )
-                        self._chase_order(snapshot)
-                        self.chase_flag = True
-                    self.filled_flag = False
-                else:  # 不是动能订单，就继续等候
-                    if self.current_cond != self.last_cond:
-                        self.sys_log(
-                            f"⏱️ [Cond_06_02] Entry_Type={entry_type},非动能单,订单提交{int(elapsed)}秒，耐心等待",
-                            level="WARN",
-                        )
-                    self.filled_flag = False
-
-            elif (
-                cond_06_03
-            ):  # 主订单已经提交超过 25秒，但是还不到 45秒。 如果是pullback单或者reversal但，就撤单。其余类型订单继续等候
-                self.current_cond = "cond_06_03"
-
-                if is_pullback or is_reversal:
-                    if self.current_cond != self.last_cond:
-                        self.sys_log(
-                            f"⏱️ [Cond_06_03] Entry_Type={entry_type}，订单提交已经{int(elapsed)}秒，撤单",
-                            level="WARN",
-                        )
-                    self._cancel_orders(
-                        snapshot,
-                        reason="pullback or reversal订单超时",
-                        is_adding=False,
-                    )
-                    self.filled_flag = False
-                else:  # ✅ 动能单和其他订单继续等到 45 秒
-                    if self.current_cond != self.last_cond:
-                        self.sys_log(
-                            f"⏱️ [Cond_06_03]Entry_Type={entry_type}，订单提交{int(elapsed)}秒，耐心等待",
-                            level="WARN",
-                        )
-                    self.filled_flag = False
-            elif cond_06_04:  # # 主订单已经提交超过 45秒，无论什么类型的订单一律撤单
-                self.current_cond = "cond_06_04"
-                elapsed_sec = int(elapsed)
+                self.current_cond = "cond_06_02"
                 if self.current_cond != self.last_cond:
                     self.sys_log(
-                        f"⏱️ [Cond_06_04]Entry_Type={entry_type}， 订单已经提交已经{int(elapsed)}秒，信号 {label} 超时，执行撤单)",
+                        f"⏱️ [Cond_06_02] 订单已提交{int(elapsed)}秒，继续耐心等待（无追单）",
                         level="WARN",
                     )
-                self._cancel_orders(snapshot, reason="超时强制撤单")
+                self.filled_flag = False  # 仅等待，不摇铃
+
+            elif cond_06_03:  # 开仓单25-45秒
+                self.current_cond = "cond_06_03"
+                if self.current_cond != self.last_cond:
+                    self.sys_log(
+                        f"⏱️ [Cond_06_03] 订单已提交{int(elapsed)}秒，继续等待至45秒强制撤单",
+                        level="WARN",
+                    )
+                self.filled_flag = False
+
+            elif cond_06_04:
+                self.current_cond = "cond_06_04"
+                if self.current_cond != self.last_cond:
+                    self.sys_log(
+                        f"⏱️ [Cond_06_04] 订单已提交{int(elapsed)}秒，强制撤单",
+                        level="WARN",
+                    )
+                self._cancel_orders(snapshot, reason="挂单超过强制撤单时限")
                 self.filled_flag = False
             elif cond_06_partial:
                 self.current_cond = "cond_06_partial"
@@ -5464,59 +6183,42 @@ class TradingContext:
                 self.filled_flag = False
                 # 正常等待：10秒黄金撮合期内不干扰
 
-            elif cond_08_02:  # 加仓单提交 60-90秒
+            # ✅ 替换为：简洁等待日志
+            elif cond_08_02:
                 self.current_cond = "cond_08_02"
-                self.filled_flag = False
-                if is_momentum:  # 仅动能单追单
-                    if not self.chase_flag:
-                        self.sys_log(
-                            f"⚡ [Cond_08_02] Entry_Type={entry_type}，动能加仓提交({int(elapsed)}秒)，执行追单",
-                            level="WARN",
-                        )
-                        self._chase_order(snapshot)
-                        self.chase_flag = True
-                else:
-                    if self.current_cond != self.last_cond:
-                        self.sys_log(
-                            f"⏱️ [Cond_08_02] Entry_Type={entry_type}，非动能加仓提交{int(elapsed)}秒，耐心等待",
-                            level="WARN",
-                        )
-
-            elif cond_08_03:  # 加仓单提交 90-120秒
-                self.current_cond = "cond_08_03"
-                if is_pullback or is_reversal:  # Pullback 和 reversal订单撤单
+                if self.current_cond != self.last_cond:
                     self.sys_log(
-                        f"⏱️ [Cond_08_03] Entry_Type={entry_type}，加仓提交已经{int(elapsed)}秒，执行撤单",
+                        f"⏱️ [Cond_08_02] 加仓单已提交{int(elapsed)}秒，继续耐心等待（无追单）",
                         level="WARN",
                     )
-                    self._cancel_orders(
-                        snapshot, reason="加仓单提交超时未成交", is_adding=True
-                    )  # ✅ 加仓场景
-                    self.filled_flag = False
-                else:
-                    if self.current_cond != self.last_cond:
-                        self.sys_log(
-                            f"⏱️ [Cond_08_03] Entry_Type={entry_type}， 加仓单提交{int(elapsed)}秒，继续等待",
-                            level="WARN",
-                        )
-                    self.filled_flag = False
+                self.filled_flag = False  # 仅等待，不摇铃
 
-            elif cond_08_04:  # 加仓单超过 120秒，如果没有部分成交，就撤单
+            elif cond_08_03:  # 加仓单25-45秒
+                self.current_cond = "cond_08_03"
+                if self.current_cond != self.last_cond:
+                    self.sys_log(
+                        f"⏱️ [Cond_08_03] 加仓单已提交{int(elapsed)}秒，继续等待至45秒强制撤单",
+                        level="WARN",
+                    )
+                self.filled_flag = False
+            elif cond_08_04:
                 self.current_cond = "cond_08_04"
                 elapsed_sec = int(elapsed)
+
                 if snapshot.has_partial_fill:
                     self.sys_log(
-                        f"⏳ [加仓单部分成交]  Entry_Type={entry_type}， 已成交{snapshot.partially_filled_orders[0].orderStatus.filled}股，"
+                        f"⏳ [加仓单部分成交] 订单已成交"
+                        f"{snapshot.partially_filled_orders[0].orderStatus.filled}股，"
                         f"剩余{snapshot.partially_filled_orders[0].orderStatus.remaining}股继续等待",
                         level="INFO",
                     )
                     self.filled_flag = False
                 else:
                     self.sys_log(
-                        f"⏱️ [Cond_08_04] Entry_Type={entry_type}， 开仓或加仓单超时{elapsed_sec}秒，强制撤单",
+                        f"⏱️ [Cond_08_04] 加仓单超时{elapsed_sec}秒，强制撤单",
                         level="WARN",
                     )
-                    self._cancel_orders(snapshot, reason="45s超时(加仓强制)")
+                    self._cancel_orders(snapshot, reason="加仓挂单超过强制撤单时限")
                     self.filled_flag = False
 
             elif cond_08_partial:  # 加仓单部分成交
@@ -5551,7 +6253,7 @@ class TradingContext:
             elif cond_08_05:
                 self.current_cond = "cond_08_05"
                 self.sys_log(
-                    f"⚖️ [Cond_08_05] Entry_Type={entry_type}，开仓或加仓成交，止损不足({stop_qty} < {abs_pos})，补齐止损",
+                    f"⚖️ [Cond_08_05] 开仓或加仓成交，止损不足({stop_qty} < {abs_pos})，补齐止损",
                     level="INFO",
                 )
                 self.filled_flag = True  # 摇铃触发纠偏
@@ -5559,7 +6261,7 @@ class TradingContext:
             elif cond_08_06:
                 self.current_cond = "cond_08_06"
                 self.sys_log(
-                    f"⚖️ [Cond_08_06] Entry_Type={entry_type}， 开仓或加仓成交，止损过量({stop_qty} > {abs_pos})，削减止损",
+                    f"⚖️ [Cond_08_06] 开仓或加仓成交，止损过量({stop_qty} > {abs_pos})，削减止损",
                     level="INFO",
                 )
                 self.filled_flag = True  # 摇铃触发纠偏
@@ -6096,10 +6798,14 @@ class TradingContext:
             self.last_stop_cond = "IDLE"
             self.last_tp_cond = "IDLE"
 
+            self.tp1_trail_anchor = None
+            self.tp1_trail_side = None
+            self.tp1_trail_cost = None
+
             # 5. 清理审计属性 (回归初始模板)
             self._temp_order_audit = {
                 "order_id": 0,
-                "label": "IDLE",
+                "label": "Unknow",
                 "trigger_price": 0.0,
                 "last_p_lmt": 0.0,
                 "last_s_aux": 0.0,
@@ -6120,7 +6826,7 @@ class TradingContext:
             self.order_features.clear()
 
             # 6. 法则旗语清理
-            self._reset_all_ready_flags()
+            # self._reset_all_ready_flags()
 
             self.sys_log(
                 "✅ [交易完成] 状态机回归 OPEN_STAGE,self.is_exiting = False,self.is_processing_order = False。",

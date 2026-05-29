@@ -118,62 +118,103 @@ STOCK_CONFIGS: dict = {
     "AAPL": {
         "risk_unit": 120,
         "max_qty": 200,
-        "eb_range_mult": 2.0,
-        "eb_vol_mult": 1.2,
-        "eb_body_ratio": 0.85,
-    },  # 蓝筹之王，低波动需降低门槛
+        "eb_range_mult": 2.0,  # 🚫 幽灵参数，保留但不使用
+        "eb_vol_mult": 1.2,  # ✅ 对应代码硬编码 1.20
+        "eb_body_ratio": 0.85,  # ⚠️ 关键修改：原字典为 0.85，但代码硬编码为 0.70，此处改为 0.70 以保持一致
+        "stop_min_gap": 0.30,
+        # ✨ 新增：大象柱分位数参数
+        "eb_body_quantile": 0.80,  # 对应原代码 quantile(0.80)
+        "eb_range_quantile": 0.80,  # 对应原代码 quantile(0.80)
+        "eb_body_max_ratio": 0.90,  # 对应原代码 0.90 * max_body_ratio
+    },
     "MSFT": {
         "risk_unit": 120,
         "max_qty": 160,
-        "eb_range_mult": 2.0,
+        "eb_range_mult": 2.0,  # 🚫 幽灵参数，保留但不使用
         "eb_vol_mult": 1.2,
-        "eb_body_ratio": 0.85,
-    },  # 同AAPL
+        "eb_body_ratio": 0.70,  # ⚠️ 同步修改为 0.70
+        "stop_min_gap": 0.30,
+        # ✨ 新增：大象柱分位数参数
+        "eb_body_quantile": 0.80,  # 对应原代码 quantile(0.80)
+        "eb_range_quantile": 0.80,  # 对应原代码 quantile(0.80)
+        "eb_body_max_ratio": 0.90,  # 对应原代码 0.90 * max_body_ratio
+    },
     # 中波动组（0.6 ≤ ATR < 1.2）：标准门槛
     "GOOG": {
         "risk_unit": 120,
         "max_qty": 160,
-        "eb_range_mult": 2.2,
+        "eb_range_mult": 2.2,  # 🚫 幽灵参数，保留但不使用
         "eb_vol_mult": 1.3,
-        "eb_body_ratio": 0.80,
+        "eb_body_ratio": 0.70,  # ⚠️ 同步修改为 0.70
+        "stop_min_gap": 0.30,
+        # ✨ 新增：大象柱分位数参数
+        "eb_body_quantile": 0.80,  # 对应原代码 quantile(0.80)
+        "eb_range_quantile": 0.80,  # 对应原代码 quantile(0.80)
+        "eb_body_max_ratio": 0.90,  # 对应原代码 0.90 * max
     },
     "AMZN": {
         "risk_unit": 120,
         "max_qty": 160,
-        "eb_range_mult": 2.2,
+        "eb_range_mult": 2.2,  # 🚫 幽灵参数，保留但不使用
         "eb_vol_mult": 1.3,
-        "eb_body_ratio": 0.80,
+        "eb_body_ratio": 0.70,  # ⚠️ 同步修改为 0.70
+        "stop_min_gap": 0.30,
+        # ✨ 新增：大象柱分位数参数
+        "eb_body_quantile": 0.80,  # 对应原代码 quantile(0.80)
+        "eb_range_quantile": 0.80,  # 对应原代码 quantile(0.80)
+        "eb_body_max_ratio": 0.90,  # 对应原代码 0.90 * max
     },
     "AMD": {
         "risk_unit": 120,
         "max_qty": 100,
-        "eb_range_mult": 2.5,
+        "eb_range_mult": 2.5,  # 🚫 幽灵参数，保留但不使用
         "eb_vol_mult": 1.4,
-        "eb_body_ratio": 0.75,
-    },  # 高影线需降低实体占比
+        "eb_body_ratio": 0.70,  # ⚠️ 同步修改为 0.70
+        "stop_min_gap": 0.30,
+        # ✨ 新增：大象柱分位数参数
+        "eb_body_quantile": 0.80,  # 对应原代码 quantile(0.80)
+        "eb_range_quantile": 0.80,  # 对应原代码 quantile(0.80)
+        "eb_body_max_ratio": 0.90,  # 对应原代码 0.90 * max
+    },
     # 高波动组（ATR ≥ 1.2）：严格门槛，过滤噪音
     "META": {
         "risk_unit": 120,
         "max_qty": 80,
-        "eb_range_mult": 2.6,
+        "eb_range_mult": 2.6,  # 🚫 幽灵参数，保留但不使用
         "eb_vol_mult": 1.5,
-        "eb_body_ratio": 0.80,
-    },  # 极高波动需提高门槛
+        "eb_body_ratio": 0.70,  # ⚠️ 同步修改为 0.70
+        "stop_min_gap": 0.30,
+        # ✨ 新增：大象柱分位数参数
+        "eb_body_quantile": 0.80,  # 对应原代码 quantile(0.80)
+        "eb_range_quantile": 0.80,  # 对应原代码 quantile(0.80)
+        "eb_body_max_ratio": 0.90,  # 对应原代码 0.90 * max
+    },
     "NVDA": {
         "risk_unit": 120,
         "max_qty": 100,
-        "eb_range_mult": 2.6,
+        "eb_range_mult": 2.6,  # 🚫 幽灵参数，保留但不使用
         "eb_vol_mult": 1.5,
-        "eb_body_ratio": 0.80,
-    },  # 当前市场核心，需最严门槛
+        "eb_body_ratio": 0.70,  # ⚠️ 同步修改为 0.70
+        "stop_min_gap": 0.30,
+        # ✨ 新增：大象柱分位数参数
+        "eb_body_quantile": 0.80,  # 对应原代码 quantile(0.80)
+        "eb_range_quantile": 0.80,  # 对应原代码 quantile(0.80)
+        "eb_body_max_ratio": 0.90,  # 对应原代码 0.90 * max
+    },
     "TSLA": {
         "risk_unit": 120,
         "max_qty": 80,
-        "eb_range_mult": 2.5,
+        "eb_range_mult": 2.5,  # 🚫 幽灵参数，保留但不使用
         "eb_vol_mult": 1.4,
-        "eb_body_ratio": 0.75,
-    },  # 高波动但需保持信号频率
+        "eb_body_ratio": 0.70,  # ⚠️ 同步修改为 0.70
+        "stop_min_gap": 0.30,
+        # ✨ 新增：大象柱分位数参数
+        "eb_body_quantile": 0.80,  # 对应原代码 quantile(0.80)
+        "eb_range_quantile": 0.80,  # 对应原代码 quantile(0.80)
+        "eb_body_max_ratio": 0.90,  # 对应原代码 0.90 * max_body_ratio
+    },
 }
+
 if symbol not in STOCK_CONFIGS:
     print(f"❌ 错误：股票 {symbol} 的配置不存在，请在 STOCK_CONFIGS 中定义。")
     sys.exit(1)
@@ -197,6 +238,14 @@ _last_vix_sync_unix = 0
 global_last_vix_close = 20.0
 vix_change_rate = 0.0
 contexts_placeholder = {}
+# VIX 15m CSV 持久化配置
+_vix_last_saved_dt = None
+_vix_today_str = datetime.now(EASTERN_TZ).strftime("%Y-%m-%d")
+VIX_15M_CSV_FILENAME = os.path.join(ensure_log_dir(), f"VIX-15m-{_vix_today_str}.csv")
+_vix_csv_header_written = (
+    os.path.exists(VIX_15M_CSV_FILENAME) and os.path.getsize(VIX_15M_CSV_FILENAME) > 0
+)
+
 COND_MSG_MAP = {
     # --- 01-04: OPEN_STAGE (待机与自愈区) ---
     "cond_01": "标准待机：系统空闲，无意图、无头寸、无挂单。",
@@ -397,7 +446,7 @@ async def load_vix_data_async(is_init=False):
     3. 10:00:05 后: 正常读取今日已合拢的 15min K线。
     """
     global global_last_vix_close, _last_vix_sync_unix, vix_change_rate
-
+    global _vix_last_saved_dt, _vix_csv_header_written, VIX_15M_CSV_FILENAME
     # --- 1. 环境感知与频率审计 ---
     now_et = datetime.now(EASTERN_TZ)
     now_time = now_et.time()
@@ -437,9 +486,9 @@ async def load_vix_data_async(is_init=False):
             bar_size = "15 mins"
 
         # --- 3. 异步错峰：避开整点/跨线点 TWS 最忙的瞬时 ---
-        if not is_init:
-            # 随机延迟 5-12 秒，确保股票 15min 缓存先更新，VIX 随后跟进
-            await asyncio.sleep(random.uniform(5, 12))
+        # if not is_init:
+        # 随机延迟 5-12 秒，确保股票 15min 缓存先更新，VIX 随后跟进
+        #    await asyncio.sleep(random.uniform(5, 12))
 
         # --- 4. 物理请求 ---
         bars = await ib.reqHistoricalDataAsync(
@@ -452,7 +501,7 @@ async def load_vix_data_async(is_init=False):
             formatDate=1,
         )
 
-        # --- 5. 数据处理与标准化 (保留原有的审计逻辑) ---
+        # --- 5.1 数据处理与标准化 (保留原有的审计逻辑) ---
         vix_raw_df = util.df(bars)
         if vix_raw_df is None or vix_raw_df.empty:
             sys_log(
@@ -489,6 +538,46 @@ async def load_vix_data_async(is_init=False):
             sys_log("⚠️ VIX RTH 过滤后无数据，使用兜底值 20.0", level="WARN")
             global_last_vix_close = 18.0
             return False
+
+        # --- 5.2 持久化 VIX 15m 到 CSV（增量写入） ---
+        try:
+            to_save = vix_df.copy()
+
+            # 只写尚未保存过的时间段
+            if _vix_last_saved_dt is not None:
+                to_save = to_save[to_save["datetime"] > _vix_last_saved_dt]
+
+            if not to_save.empty:
+                to_save = to_save.sort_values("datetime").copy()
+                to_save["datetime"] = pd.to_datetime(
+                    to_save["datetime"], errors="coerce"
+                )
+                to_save = to_save[to_save["datetime"].notna()]
+
+                if not to_save.empty:
+                    _vix_last_saved_dt = to_save["datetime"].max()
+                    to_save["datetime"] = to_save["datetime"].dt.strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+
+                    export_cols = [
+                        c
+                        for c in ["datetime", "open", "high", "low", "close", "volume"]
+                        if c in to_save.columns
+                    ]
+                    to_save = to_save[export_cols]
+
+                    to_save.to_csv(
+                        VIX_15M_CSV_FILENAME,
+                        mode="a",
+                        index=False,
+                        header=not _vix_csv_header_written,
+                        encoding="utf-8-sig",
+                    )
+                    _vix_csv_header_written = True
+
+        except Exception as e:
+            sys_log(f"⚠️ [VIX CSV写入失败] {e}", level="WARN")
 
         # --- 6. 提取结果与对账 ---
         vix_len = len(vix_df)
@@ -620,8 +709,8 @@ async def daily_closing_safety_guard(contexts):
     while True:
 
         now_time = datetime.now(EASTERN_TZ).time()
-        # 统一在 15:56分触发集体平仓
-        if now_time >= time(15, 56):
+        # 统一在 12:16分触发集体平仓      
+        if now_time >= time(12, 16):
             sys_log(f"🚨 [收盘清仓开始] 系统时间已到 {now_time}，各股票执行清仓操作...")
 
             # 1. 并行调用所有 Context 对象的清仓逻辑

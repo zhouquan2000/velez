@@ -171,6 +171,7 @@ class ContextSnapshot:
                 ),
                 self.entry_orders[0],  # 兜底：用第一个
             )
+            self.main_order = main_order
             main_order_id = main_order.orderId
             self.main_order_id = main_order.orderId
             self.main_order_entry_type = self.order_features.get(main_order_id, {}).get(
@@ -183,6 +184,7 @@ class ContextSnapshot:
                 "action", "Unknown"
             )
         else:
+            self.main_order = None
             self.main_order_id = None
             self.main_order_entry_type = "Unknown"
             self.main_order_label = "Unknown"

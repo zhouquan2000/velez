@@ -383,6 +383,7 @@ def on_bar_update(*args):
         if new_2min_bar:
 
             formatted_bar = (
+                f"Time:{start_t.strftime('%H:%M')},"
                 f"O:{new_2min_bar['open']:.3f}, "
                 f"H:{new_2min_bar['high']:.3f}, "
                 f"L:{new_2min_bar['low']:.3f}, "
@@ -390,7 +391,7 @@ def on_bar_update(*args):
                 f"V:{int(new_2min_bar['volume'])}"
             )
             ctx.sys_log(
-                f"🟢 [2分钟K线] {start_t.strftime('%H:%M')} 合成完毕 | {formatted_bar}",
+                f"🟢 [2分钟K线] 合成完毕 | {formatted_bar}",
                 level="INFO",
             )
             ctx.process_new_2min_bar(new_2min_bar)
@@ -400,7 +401,60 @@ def on_bar_update(*args):
                 f"⚠️ [合成跳过] {start_t.strftime('%H:%M')} 完全无5s样本且不满足补票条件",
                 level="WARN",
             )
-        # --- 5. 清理与推进 ---
+
+        # --- 5.0 在 drop 过期 5s 数据前，先把增量 5s 数据落盘 ---
+        try:
+            if not ctx.raw_5s_buffer.empty and "datetime" in ctx.raw_5s_buffer.columns:
+                to_save = ctx.raw_5s_buffer.copy()
+
+                # 只保存未写入过的增量
+                if getattr(ctx, "last_5s_saved_dt", None) is not None:
+                    to_save = to_save[to_save["datetime"] > ctx.last_5s_saved_dt]
+
+                if not to_save.empty:
+                    to_save = to_save.sort_values("datetime").copy()
+                    to_save["datetime"] = pd.to_datetime(
+                        to_save["datetime"], errors="coerce"
+                    )
+                    to_save = to_save[to_save["datetime"].notna()]
+
+                    if not to_save.empty:
+                        last_saved_dt = to_save["datetime"].max()
+
+                        # 时间格式按你要求保留到 hh:mm:ss
+                        to_save["datetime"] = to_save["datetime"].dt.strftime(
+                            "%H:%M:%S"
+                        )
+
+                        export_cols = [
+                            c
+                            for c in [
+                                "datetime",
+                                "open",
+                                "high",
+                                "low",
+                                "close",
+                                "volume",
+                            ]
+                            if c in to_save.columns
+                        ]
+                        to_save = to_save[export_cols]
+
+                        to_save.to_csv(
+                            ctx.raw_5s_csv_filename,
+                            mode="a",
+                            index=False,
+                            header=not ctx.raw_5s_csv_header_written,
+                            encoding="utf-8-sig",
+                        )
+
+                        ctx.raw_5s_csv_header_written = True
+                        ctx.last_5s_saved_dt = last_saved_dt
+
+        except Exception as e:
+            ctx.sys_log(f"⚠️ [5s CSV写入失败] {e}", level="WARN")
+
+        # --- 6. 清理与推进 ---
         # ✨ 清理过期的 5s 缓冲区，防止内存溢出
         ctx.raw_5s_buffer = ctx.raw_5s_buffer[
             ctx.raw_5s_buffer["datetime"] > last_dt - timedelta(minutes=10)

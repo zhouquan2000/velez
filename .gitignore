@@ -1,3 +1,10 @@
 __pycache__/
 velez_bot/__pycache__/
 log_file/
+backtest/backtest_old_version.py
+monitor.bat
+startall.bat
+venv/
+env/
+*.pyc
+.pytest_cache/

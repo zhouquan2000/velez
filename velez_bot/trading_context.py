@@ -720,23 +720,34 @@ class TradingContext:
             print(f"❌ 审计日志写入失败: {e}")
 
     def play_sound(self, sound_type: str):
-        """[类方法] 感官报警系统：为不同交易事件分配独立音色 (移植自 06-9)"""
-        try:
-            if sound_type == "ENTRY":
-                winsound.Beep(1200, 300)  # 入场：高音 (1200Hz)
-            elif sound_type == "EXIT":
-                winsound.Beep(800, 500)  # 出场：中音 (800Hz)
-            elif sound_type == "ELEPHANT":
-                # 大象柱发现：急促三连音
-                for _ in range(3):
-                    winsound.Beep(1500, 100)
-            elif sound_type == "SUSPEND":
-                # 熔断警报：长低音 (400Hz)
-                winsound.Beep(400, 1000)
-            elif sound_type == "ALERT":
-                winsound.Beep(1000, 500)  # 一般预警
-        except Exception:
-            pass  # 容错处理
+        """[类方法] 感官报警系统：为不同交易事件分配独立音色 (移植自 06-9)
+
+        🔇 原 Windows 专用 winsound.Beep 声音报警在 Linux 下不可用，已整体注释停用。
+        保留方法签名与调用点，仅退化为无操作(no-op)，不影响交易逻辑。
+        原音色映射(已停用)：
+            ENTRY    -> 1200Hz 300ms (入场:高音)
+            EXIT     ->  800Hz 500ms (出场:中音)
+            ELEPHANT -> 1500Hz 100ms x3 (大象柱:三连音)
+            SUSPEND  ->  400Hz 1000ms (熔断:长低音)
+            ALERT    -> 1000Hz 500ms (一般预警)
+        """
+        # try:
+        #     if sound_type == "ENTRY":
+        #         winsound.Beep(1200, 300)  # 入场：高音 (1200Hz)
+        #     elif sound_type == "EXIT":
+        #         winsound.Beep(800, 500)  # 出场：中音 (800Hz)
+        #     elif sound_type == "ELEPHANT":
+        #         # 大象柱发现：急促三连音
+        #         for _ in range(3):
+        #             winsound.Beep(1500, 100)
+        #     elif sound_type == "SUSPEND":
+        #         # 熔断警报：长低音 (400Hz)
+        #         winsound.Beep(400, 1000)
+        #     elif sound_type == "ALERT":
+        #         winsound.Beep(1000, 500)  # 一般预警
+        # except Exception:
+        #     pass  # 容错处理
+        return  # Linux 下声音报警停用
 
     async def load_history_data(self):
         """
@@ -4124,7 +4135,7 @@ class TradingContext:
         """
         curr_time = datetime.now(EASTERN_TZ).time()
         curr_dt = datetime.now(EASTERN_TZ)
-        if curr_time < time(10, 0) or curr_time > time(12, 0):
+        if curr_time < time(10, 0) or curr_time > time(15, 30):  # 🧪 测试期下单窗口放宽至 15:30 (原 12:00)
             return None
 
         # 1) 熔断直接返回
@@ -4607,9 +4618,9 @@ class TradingContext:
 
             # --- 4. 时间闸门拦截 ---
             now_et = datetime.now(EASTERN_TZ).time()
-            if not (time(10, 0) <= now_et <= time(12, 0)):
+            if not (time(10, 0) <= now_et <= time(15, 30)):  # 🧪 测试期下单窗口放宽至 15:30 (原 12:00)
                 self.sys_log(
-                    f"🚫 [时间禁令] 当前时间{now_et}，程序在9:30-10:00以及15:30-15:58两个时间段禁止入场交易，仅记录信号或者被动止盈止损。",
+                    f"🚫 [时间禁令] 当前时间{now_et}，程序仅在10:00-15:30允许入场交易(测试期放宽)，其余时段仅记录信号或被动止盈止损。",
                     level="INFO",
                 )
                 return

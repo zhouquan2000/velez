@@ -642,14 +642,14 @@ def on_tws_error(reqId, errorCode, errorString, contract):
             f"🚨 [TWS警报] 与IBKR服务器的物理链路中断！程序进入静默等待：{error_msg}",
             level="TWS-Alert",
         )
-        winsound.Beep(1000, 1000)
+        # winsound.Beep(1000, 1000)  # 🔇 Windows专用声音函数，Linux下注释停用
 
     # --- B类：复连自愈 (2104, 1102) ---
     elif errorCode in {2104, 1102}:
         sys_log(
             f"✅ [TWS恢复] 连接已重建！启动全品种 V5.0 物理审计...", level="TWS-Msg"
         )
-        winsound.Beep(2000, 300)
+        # winsound.Beep(2000, 300)  # 🔇 Windows专用声音函数，Linux下注释停用
 
         # ✨【V5.0 链式对账】：
         # 不再手动读取 positions，而是驱动每个品种的类实例去执行“自我发现”
@@ -709,8 +709,8 @@ async def daily_closing_safety_guard(contexts):
     while True:
 
         now_time = datetime.now(EASTERN_TZ).time()
-        # 统一在 12:16分触发集体平仓      
-        if now_time >= time(12, 16):
+        # 🧪 测试期：收盘清仓触发时间放宽至 15:56 (原 12:16)，配合 10:00-15:30 下单窗口
+        if now_time >= time(15, 56):
             sys_log(f"🚨 [收盘清仓开始] 系统时间已到 {now_time}，各股票执行清仓操作...")
 
             # 1. 并行调用所有 Context 对象的清仓逻辑

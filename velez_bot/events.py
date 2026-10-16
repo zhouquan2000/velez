@@ -178,7 +178,11 @@ def on_exec_details(trade, fill):
         # 4. 🆕 新财务结算逻辑 (替换旧的 _process_fill)
         # 初始化新结算状态 (如果还没初始化)
         if oid not in ctx.settlement_ledger:
-            is_closing = order_ref.startswith(("S_", "TP", "CL", "EXIT"))
+            # 🔥 ES_ = 紧急独立止损单(parentId=0，断连后手术B补建)。它平仓时也必须是
+            #    平仓单(is_closing=True)，否则 _finalize_financials 会走 IBKR_Comm_Only 分支、
+            #    把 IBKR 回报的真实盈亏清零(2026-10-16 GOOG 因此漏记 -76.55)。
+            #    前缀集合须与 trading_context.py log_trade 里的 is_closing 判断保持一致。
+            is_closing = order_ref.startswith(("S_", "ES", "TP", "CL", "EXIT"))
             # 获取标签信息 (兼容旧版)
             label = "UNKNOWN"
             if hasattr(ctx, "_temp_order_audit") and isinstance(

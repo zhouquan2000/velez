@@ -5282,7 +5282,7 @@ class TradingContext:
                     if action == "SELL"
                     else round(price + 0.01, 2)
                 )
-                m_order = LimitOrder(action, final_qty, final_price)
+                m_order = LimitOrder(action, final_qty, final_price, tif='DAY')
                 m_order.algoStrategy = "Adaptive"
                 m_order.algoParams = [TagValue("adaptivePriority", "Normal")]
                 m_order.orderRef = (
@@ -5291,7 +5291,7 @@ class TradingContext:
                     ]
                 )
             else:
-                m_order = MarketOrder(action, final_qty)
+                m_order = MarketOrder(action, final_qty, tif='DAY')
                 m_order.algoStrategy = "Adaptive"
                 m_order.algoParams = [TagValue("adaptivePriority", "Urgent")]
                 m_order.orderRef = (
@@ -5464,7 +5464,7 @@ class TradingContext:
                 )
                 active_stop = None  # 回退到开新仓逻辑
             # --- 4. 构造主订单 ---
-            p_order = LimitOrder(action, qty, lmt_price)
+            p_order = LimitOrder(action, qty, lmt_price, tif='DAY')
             p_order.algoStrategy = "Adaptive"
             p_order.algoParams = [TagValue("adaptivePriority", priority)]
             # ✅ 开新仓：父 transmit False，等子单带着一起发
@@ -5539,7 +5539,7 @@ class TradingContext:
 
             else:
                 # B. 【开新仓状态】：新建随动止损单，挂钩主单 ID
-                s_order = StopOrder(rev_action, qty, round(sl, 2))
+                s_order = StopOrder(rev_action, qty, round(sl, 2), tif='DAY')
                 s_order.parentId = p_id
                 s_order.transmit = True
                 s_order.orderRef = f"S_{self.symbol[:4]}_{safe_label[:5]}_{s_action[:3]}_sto_{timestr}"[
@@ -5654,12 +5654,12 @@ class TradingContext:
             lmt_price = round(
                 ticker.bid - 0.05 if action == "SELL" else ticker.ask + 0.05, 2
             )
-            close_order = LimitOrder(action, qty, lmt_price)
+            close_order = LimitOrder(action, qty, lmt_price, tif='DAY')
             order_ref = f"CL_{self.symbol}_Close_{abv_action[:3]}_lmt_{timestr[:6]}"[
                 :32
             ]  # Cl=Close（与收盘平仓单统一前缀）
         else:
-            close_order = MarketOrder(action, qty)
+            close_order = MarketOrder(action, qty, tif='DAY')
             order_ref = f"CL_{self.symbol}_Close_{abv_action[:3]}_mkt_{timestr[:6]}"[
                 :32
             ]  # Cl=Close（与收盘平仓单统一前缀）
@@ -6105,7 +6105,7 @@ class TradingContext:
                 # 不撤单，仅延长观察期
                 if p_f_elapsed > 10:  # 上一笔部分成交过去已经超过10秒
                     self.sys_log(
-                        "⚠️ [开仓单部分成交超时] 开仓单部分成交，剩余部分已经过了{elapsed}秒还未成交，尝试撤单剩余量",
+                        f"⚠️ [开仓单部分成交超时] 开仓单部分成交，剩余部分已经过了{elapsed}秒还未成交，尝试撤单剩余量",
                         level="WARN",
                     )
                     self._cancel_orders(
@@ -6115,7 +6115,7 @@ class TradingContext:
                 else:
                     # 部分成交，耐心等待
                     self.sys_log(
-                        "⚠️ [部分成交] 上笔部分成交之后已经{p_f_elapsed}秒，继续等待剩余订单成交",
+                        f"⚠️ [部分成交] 上笔部分成交之后已经{p_f_elapsed}秒，继续等待剩余订单成交",
                         level="WARN",
                     )
                     self.filled_flag = False
@@ -6229,7 +6229,7 @@ class TradingContext:
                         f"⏱️ [Cond_08_04] 加仓单超时{elapsed_sec}秒，强制撤单",
                         level="WARN",
                     )
-                    self._cancel_orders(snapshot, reason="加仓挂单超过强制撤单时限")
+                    self._cancel_orders(snapshot, reason="加仓挂单超过强制撤单时限", is_adding=True)
                     self.filled_flag = False
 
             elif cond_08_partial:  # 加仓单部分成交
@@ -6245,18 +6245,19 @@ class TradingContext:
                 # 不撤单，仅延长观察期
                 if p_f_elapsed > 10:  # 上一笔部分成交过去已经超过10秒
                     self.sys_log(
-                        "⚠️ [加仓单部分成交超时] 剩余部分已经{p_f_elapsed}秒还未成交，尝试撤单剩余量",
+                        f"⚠️ [加仓单部分成交超时] 剩余部分已经{p_f_elapsed}秒还未成交，尝试撤单剩余量",
                         level="WARN",
                     )
                     self._cancel_orders(
                         snapshot,
-                        reason="加仓单部分成交，剩余订单超{p_f_elapsed}秒未成交，强制撤单",
+                        reason=f"加仓单部分成交，剩余订单超{p_f_elapsed}秒未成交，强制撤单",
+                        is_adding=True,
                     )
                     self.filled_flag = False
                 else:
                     # 部分成交，耐心等待
                     self.sys_log(
-                        "⚠️ [加仓单部分成交等候] 加仓单部分成交之后刚过{p_f_elapsed}秒，继续等待剩余订单成交",
+                        f"⚠️ [加仓单部分成交等候] 加仓单部分成交之后刚过{p_f_elapsed}秒，继续等待剩余订单成交",
                         level="WARN",
                     )
                     self.filled_flag = False
@@ -6334,7 +6335,7 @@ class TradingContext:
                 self.sys_log(
                     f"⚠️ [Cond_08_08] 未定义加仓状态组合，执行强制撤单", level="ERROR"
                 )
-                self._cancel_orders(snapshot, reason="异常状态强制撤单")
+                self._cancel_orders(snapshot, reason="异常状态强制撤单", is_adding=True)
                 self.filled_flag = False
                 try:
                     for t in snapshot.live_trades:
@@ -6536,6 +6537,23 @@ class TradingContext:
             # 格式化价格
             target_price = round(target_price, 2)
 
+            # 🔥 加固：提交新独立止损单前，先取消同 symbol 已有的独立止损单，杜绝堆积死循环
+            for _t in self.ib.openTrades():
+                _o = _t.order
+                _ref = getattr(_o, "orderRef", "") or ""
+                _otype = (getattr(_o, "orderType", "") or "").upper()
+                if (
+                    _t.contract.symbol == self.symbol
+                    and _t.isActive()
+                    and _ref.startswith("ES_")
+                    and _otype in ("STP", "STP LMT")
+                ):
+                    self.sys_log(
+                        f"🧹 [add_stop前置清理] 取消已有独立止损单 ID:{_o.orderId} | Ref:{_ref[:32]}",
+                        level="WARN",
+                    )
+                    self.ib.cancelOrder(_o)
+
             # --- 3. 构造与提交订单 ---
             action = "SELL" if snapshot.direction == "LONG" else "BUY"
             abv_action = "BOT" if action == "BUY" else "SLD"
@@ -6547,7 +6565,7 @@ class TradingContext:
                 :32
             ]  # ES=Emergency Stop
             # 独立止损单，不绑定 parentId
-            new_stop = StopOrder(action, qty, target_price)
+            new_stop = StopOrder(action, qty, target_price, tif='DAY')
             new_stop.orderRef = order_ref  # ✅ 关键：设置orderRef
             # --- 4. 物理执行与意图转正 ---
             # 物理加锁：防止在订单确认前产生重复指令
@@ -6926,12 +6944,12 @@ class TradingContext:
                 order_ref = (
                     f"CL_{self.symbol}_Close_{abv_action[:3]}_lmt_{timestr[:6]}"[:32]
                 )  # CL=Close
-                close_order = LimitOrder(action, qty, lmt_price)
+                close_order = LimitOrder(action, qty, lmt_price, tif='DAY')
             else:
                 order_ref = (
                     f"CL_{self.symbol}_Close_{abv_action[:3]}_mkt_{timestr[:6]}"[:32]
                 )  # CL=Close
-                close_order = MarketOrder(action, qty)
+                close_order = MarketOrder(action, qty, tif='DAY')
             self.sys_log(
                 f"📡 [强平执行] 准备尝试第 {attempt+1} 次平仓 |生成订单Ref:{order_ref} | 实仓:{pos.position} | 参考价:{trigger_p}",
                 level="INFO",

@@ -8,3 +8,7 @@ venv/
 env/
 *.pyc
 .pytest_cache/
+.venv/
+.venv.broken_py314/
+.env
+__pycache__/

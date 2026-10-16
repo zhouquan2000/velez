@@ -28,7 +28,28 @@ from .shared import (
 )
 from .trading_context import TradingContext
 from .events import on_exec_details, on_bar_update
-from .shared import on_tws_error
+from .shared import on_tws_error, on_disconnected, set_reconnect_hook, setup_ib_insync_logging
+
+
+def resubscribe_streams():
+    """重新订阅 5s 实时数据（断连重连后调用）。"""
+    for symbol, ctx in contexts_placeholder.items():
+        if ctx.suspend_today:
+            ctx.log(
+                f"🚫 {symbol} 今日暂停交易，不再与TWS服务器进行数据同步", level="ERROR"
+            )
+            continue
+        try:
+            bars = ib.reqRealTimeBars(ctx.contract, 5, "TRADES", useRTH=False)
+            bars.updateEvent += on_bar_update
+            ctx.bars_reference = bars
+            ctx.log(
+                f"📡 {symbol}与TWS服务器的实时链路已经建立，接收5秒bar数据 (RTH: Off)"
+            )
+        except Exception as e:
+            ctx.log(
+                f"❌ {symbol}与TWS服务器的数据链路异常，错误代码: {e}", level="ERROR"
+            )
 
 
 async def main():
@@ -69,6 +90,10 @@ async def main():
     # 3. errorEvent - 全局错误监听器
     ib.errorEvent += on_tws_error
     sys_log("📥 TWS 系统报错监听器函数已加载...")
+    # 4. 断连自动重连
+    ib.disconnectedEvent += on_disconnected
+    set_reconnect_hook(resubscribe_streams)
+    sys_log("🔌 断连自动重连已启用，连接断开时将自动重连...")
     # ======================================================================
     for symbol, ctx in contexts_placeholder.items():
         sys_log(
@@ -157,27 +182,7 @@ async def main():
         sys_log("🚨 [SECURITY ALERT] 没有能接收到实时行情，请立即处理！", level="ALERT")
 
     # 6. 启动 5s 实时链路
-    active_streams = []
-    for symbol, ctx in contexts_placeholder.items():
-        # ✨ 关键补丁：如果初始化失败，跳过实时链路挂载
-        if ctx.suspend_today:
-            ctx.log(
-                f"🚫 {symbol} 今日暂停交易，不再与TWS服务器进行数据同步", level="ERROR"
-            )
-            continue
-
-        try:
-            bars = ib.reqRealTimeBars(ctx.contract, 5, "TRADES", useRTH=False)
-            bars.updateEvent += on_bar_update
-            ctx.bars_reference = bars
-            active_streams.append(bars)
-            ctx.log(
-                f"📡 {symbol}与TWS服务器的实时链路已经建立，接收5秒bar数据 (RTH: Off)"
-            )
-        except Exception as e:
-            ctx.log(
-                f"❌ {symbol}与TWS服务器的数据链路异常，错误代码: {e}", level="ERROR"
-            )
+    resubscribe_streams()
     sys_log("🚀 一切准备就绪，等待TWS传送来的各个股票的5秒bar实时行情", level="INFO")
 
     # 启动每日安全守护
@@ -189,6 +194,8 @@ async def main():
 
 
 def run():
+    # 0. 把 ib_insync 库的 logger 输出（Error 162、request timed out 等）接到日志文件
+    setup_ib_insync_logging()
     # 1. variable initialization for safe KeyboardInterrupt cleanup
     loop = asyncio.get_event_loop()
 

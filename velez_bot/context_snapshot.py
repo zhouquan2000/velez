@@ -94,11 +94,16 @@ class ContextSnapshot:
             ref = getattr(o, "orderRef", "") or ""
             otype = (getattr(o, "orderType", "") or "").upper()
             parent_id = getattr(o, "parentId", 0)
-            # ✅ 必须是真正的 child order（Bracket Stop）
+            is_stop_ref = ref.startswith("S_") or ref.startswith("ES_")
+            # ✅ Bracket Stop（parentId≠0）照常识别
+            is_bracket_stop = parent_id not in (0, None)
+            # ✅ 独立止损单（ES_ 前缀、parentId=0）在有持仓时也必须识别，
+            #    否则 _update_stop 找不到它、每次走 add_stop 新建，导致止损单堆积死循环
+            is_standalone_stop = ref.startswith("ES_") and self.abs_pos > 0
             if (
                 otype in ("STP", "STP LMT")
-                and parent_id not in (0, None)  # ← 关键修复
-                and (ref.startswith("S_") or ref.startswith("ES_"))
+                and is_stop_ref
+                and (is_bracket_stop or is_standalone_stop)
             ):
                 self.active_stop_order = o
                 break

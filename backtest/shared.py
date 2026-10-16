@@ -104,6 +104,8 @@ parser = argparse.ArgumentParser(description="Velez量化交易系统 - 参数�
 
 parser.add_argument("--symbol", type=str, default="AAPL", help="股票代码 (默认: AAPL)")
 parser.add_argument("--clientid", type=int, default=31, help="客户端ID (默认: 31)")
+parser.add_argument("--host", type=str, default="127.0.0.1", help="TWS/IB Gateway 主机地址 (默认: 127.0.0.1)")
+parser.add_argument("--port", type=int, default=4002, help="TWS/IB Gateway 端口 (Paper Gateway=4002, TWS Paper=7497)")
 # parser.add_argument('--client_id', type=int, required=True, help='TWS 客户端 ID，如 31')
 args = parser.parse_args()
 
@@ -187,8 +189,8 @@ if cl_id is None:
 # eb_vol_mult:   成交量相对于过去 20 根均量的倍数 (资金确认)
 # eb_body_ratio: 实体占整根 K 线长度的最小比例 (纯度)
 try:
-    ib.connect("127.0.0.1", 7497, clientId=cl_id)
-    print(f"✅ 连接成功 | 股票代码: {args.symbol} | ClientID: {cl_id}")
+    ib.connect(args.host, args.port, clientId=cl_id)
+    print(f"✅ 连接成功 | 股票代码: {args.symbol} | ClientID: {cl_id} | {args.host}:{args.port}")
 except Exception as e:
     print(f"❌ 连接TWS失败: {e}")
     os._exit(0)

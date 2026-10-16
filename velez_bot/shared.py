@@ -104,6 +104,8 @@ parser = argparse.ArgumentParser(description="Velez量化交易系统 - 参数�
 
 parser.add_argument("--symbol", type=str, default="AAPL", help="股票代码 (默认: AAPL)")
 parser.add_argument("--clientid", type=int, default=31, help="客户端ID (默认: 31)")
+parser.add_argument("--host", type=str, default="127.0.0.1", help="TWS/IB Gateway 主机地址 (默认: 127.0.0.1)")
+parser.add_argument("--port", type=int, default=4002, help="TWS/IB Gateway 端口 (Paper Gateway=4002, TWS Paper=7497)")
 # parser.add_argument('--client_id', type=int, required=True, help='TWS 客户端 ID，如 31')
 args = parser.parse_args()
 
@@ -228,8 +230,8 @@ if cl_id is None:
 # eb_vol_mult:   成交量相对于过去 20 根均量的倍数 (资金确认)
 # eb_body_ratio: 实体占整根 K 线长度的最小比例 (纯度)
 try:
-    ib.connect("127.0.0.1", 7497, clientId=cl_id)
-    print(f"✅ 连接成功 | 股票代码: {args.symbol} | ClientID: {cl_id}")
+    ib.connect(args.host, args.port, clientId=cl_id)
+    print(f"✅ 连接成功 | 股票代码: {args.symbol} | ClientID: {cl_id} | {args.host}:{args.port}")
 except Exception as e:
     print(f"❌ 连接TWS失败: {e}")
     os._exit(0)
@@ -328,6 +330,28 @@ def sys_log(msg, level="System"):
     except Exception as e:
         # 如果系统日志写入失败，仅在控制台紧急报警 (防止死循环报错)
         print(f"🚨 [System I/O Error] 无法写入全局日志文件: {e}")
+
+
+def setup_ib_insync_logging():
+    """把 ib_insync 库的 logger 输出（Error 162、request timed out 等）接到日志文件。
+
+    这些输出默认只到 stderr（屏幕），不经过程序的 sys_log。
+    加 FileHandler 后：屏幕显示不变（仍 propagate 到 stderr），同时落盘到文件。
+    """
+    import logging
+
+    ib_logger = logging.getLogger("ib_insync")
+    # 幂等：避免重复初始化时叠加 handler
+    for h in ib_logger.handlers:
+        if isinstance(h, logging.FileHandler):
+            return
+    ib_logger.setLevel(logging.INFO)
+    fh = logging.FileHandler(
+        os.path.join(ensure_log_dir(), "ib_insync_debug.log"),
+        encoding="utf-8",
+    )
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s %(message)s"))
+    ib_logger.addHandler(fh)
 
 
 # 建议在重构测试时使用独立的 clientId，避免干扰明天的 06-9 实战
@@ -618,6 +642,124 @@ async def load_vix_data_async(is_init=False):
         return False
 
 
+# ======================================================================
+# --- 🔌 断连自动重连 (V5.1) ---
+# ======================================================================
+_reconnect_task = None
+_reconnect_hook = None  # 重连成功后的重新订阅回调（由 app.py 注入，避免 shared→events 循环 import）
+MAX_RECONNECT_ATTEMPTS = 10
+RECONNECT_BACKOFF_INIT = 2.0  # 初始退避秒数
+RECONNECT_BACKOFF_MAX = 60.0  # 最大退避秒数
+
+
+def set_reconnect_hook(fn):
+    """由 app.py 注入重连成功后的重新订阅函数，避免 shared→events 循环 import。"""
+    global _reconnect_hook
+    _reconnect_hook = fn
+
+
+def on_disconnected():
+    """ib.disconnectedEvent 回调：TCP 断开(含 Peer closed connection)时触发自动重连。"""
+    global _reconnect_task
+    if _reconnect_task and not _reconnect_task.done():
+        return  # 已有重连在跑，去重
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = asyncio.get_event_loop()  # fallback：不在运行循环内
+    sys_log(
+        "🔌 [断连检测] 检测到与 TWS 的连接断开，启动自动重连...",
+        level="CRITICAL",
+    )
+    # call_soon_threadsafe：同线程/跨线程都安全，确保在事件循环线程里创建任务
+    running_loop.call_soon_threadsafe(_start_reconnect, running_loop)
+
+
+def _start_reconnect(running_loop):
+    """在事件循环线程里启动重连协程。"""
+    global _reconnect_task
+    if _reconnect_task and not _reconnect_task.done():
+        return
+    _reconnect_task = running_loop.create_task(reconnect_loop())
+
+
+_last_sync_time = 0.0
+SYNC_MIN_INTERVAL = 3.0  # 秒：短时间内重复同步请求去重
+
+
+_pending_sync_tasks = set()
+
+
+def _schedule_sync(tag):
+    """在事件循环里调度异步持仓同步（供 on_tws_error 同步回调使用）。"""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(sync_all_positions(tag))
+    _pending_sync_tasks.add(task)
+    task.add_done_callback(_pending_sync_tasks.discard)
+
+
+async def sync_all_positions(tag="链路自愈"):
+    """同步所有品种持仓（先刷新柜台数据，再物理对账）。
+
+    on_tws_error 的 1102 复连分支 与 reconnect_loop 重连成功 都会调用本函数。
+    带节流去重 + 先刷新 positions/openOrders 缓存：重连后 ib.positions()/openTrades()
+    是内存缓存、异步填充有时序差（挂单先到位、持仓后到位），不先刷新会读到
+    "持仓0"误判为无头寸，进而错误取消保护持仓的止损单（Cond_10 误触发）。
+    """
+    global _last_sync_time
+    now = time_module.time()
+    if now - _last_sync_time < SYNC_MIN_INTERVAL:
+        return  # 短时间内已同步过，跳过
+    _last_sync_time = now
+    # 关键修复：先主动刷新柜台数据缓存，确保 take_snapshot 读到完整持仓+挂单
+    try:
+        await ib.reqPositionsAsync()
+        await ib.reqOpenOrdersAsync()
+    except Exception as e:
+        sys_log(f"⚠️ [{tag}] 刷新柜台数据失败: {e}", level="WARN")
+    for symbol, ctx in contexts_placeholder.items():
+        try:
+            snapshot = ctx.take_snapshot()
+            if snapshot:
+                ctx._sync_position(snapshot)
+                ctx.filled_flag = True
+                ctx.log(f"🔄 [{tag}] 实际持仓:{snapshot.fact_pos} | 逻辑状态已同步。")
+        except Exception as e:
+            ctx.log(f"❌ [{tag}] 品种 {symbol} 对账异常: {e}", level="ERROR")
+
+
+async def reconnect_loop():
+    """重连循环：指数退避重试，成功后重新订阅 + 同步持仓，失败告警退出。"""
+    global _reconnect_hook
+    backoff = RECONNECT_BACKOFF_INIT
+    for attempt in range(1, MAX_RECONNECT_ATTEMPTS + 1):
+        try:
+            sys_log(
+                f"🔄 [自动重连] 第 {attempt}/{MAX_RECONNECT_ATTEMPTS} 次尝试连接 "
+                f"{args.host}:{args.port} (clientId={cl_id}) ...",
+                level="System",
+            )
+            await ib.connectAsync(args.host, args.port, clientId=cl_id, timeout=4)
+            sys_log("✅ [自动重连] 连接成功，开始同步持仓...", level="System")
+            # 1. 同步持仓（公共函数，带节流去重，与 1102 分支共享）
+            await sync_all_positions("重连对账")
+            # 2. 重新订阅实时数据（通过 app.py 注入的回调）
+            if _reconnect_hook:
+                _reconnect_hook()
+            sys_log("✅ [自动重连] 全部完成，恢复正常运行。", level="System")
+            return
+        except Exception as e:
+            sys_log(f"⚠️ [自动重连] 第 {attempt} 次失败: {e}", level="WARN")
+            if attempt < MAX_RECONNECT_ATTEMPTS:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX)
+    sys_log("🚨 [自动重连失败] 超过最大重试次数，程序退出以避免静默空转。", level="CRITICAL")
+    os._exit(1)
+
+
 def on_tws_error(reqId, errorCode, errorString, contract):
     """
     [系统级指挥部 - 2026-01-20 终极复用版]
@@ -643,6 +785,7 @@ def on_tws_error(reqId, errorCode, errorString, contract):
             level="TWS-Alert",
         )
         # winsound.Beep(1000, 1000)  # 🔇 Windows专用声音函数，Linux下注释停用
+        on_disconnected()  # 🔥 触发自动重连
 
     # --- B类：复连自愈 (2104, 1102) ---
     elif errorCode in {2104, 1102}:
@@ -651,33 +794,23 @@ def on_tws_error(reqId, errorCode, errorString, contract):
         )
         # winsound.Beep(2000, 300)  # 🔇 Windows专用声音函数，Linux下注释停用
 
-        # ✨【V5.0 链式对账】：
-        # 不再手动读取 positions，而是驱动每个品种的类实例去执行“自我发现”
-        for symbol, ctx in contexts_placeholder.items():
-            try:
-                # 1. 物理采集：咔嚓一下，拍下当前柜台真相
-                snapshot = ctx.take_snapshot()
-
-                if snapshot:
-                    # 2. 逻辑同步：将真相灌装进内存状态机（纠正 state, 成本, 锁等）
-                    ctx._sync_position(snapshot)
-
-                    # 3. 摇铃标记：确保 5s 后的主循环节拍再次进行二次确认
-                    ctx.filled_flag = True
-
-                    ctx.log(
-                        f"🔄 [链路自愈完成] 实际持仓:{snapshot.fact_pos} | 逻辑状态已同步。"
-                    )
-            except Exception as e:
-                ctx.log(f"❌ [自愈失败] 品种 {symbol} 对账异常: {e}", level="ERROR")
+        # ✨【V5.0 链式对账】：调度异步对账（先刷新柜台数据再同步）
+        _schedule_sync("链路自愈")
 
     # --- C类：常规错误记录 ---
     else:
-        # 在平时保持静默。
-        # 如果有一天遇到莫名其妙的问题，可以临时取消下面的注释，
-        # 看看 TWS 到底在后台“嘟囔”些什么。
-        # sys_log(f"⚪ TWS-Notice: {error_msg}", level="TWS-Msg")
-        pass
+        # 记录所有非常规错误（HMDS 162、TIF 10349、订单被拒 201/110 等），
+        # 让屏幕上的意外报错也能进日志文件复盘。
+        # （2026-10-16 Error 201 订单被拒曾因静默导致死循环未被察觉）
+        try:
+            sym = contract.symbol if contract is not None else None
+            ctx = contexts_placeholder.get(sym) if sym else None
+            if ctx is not None:
+                ctx.sys_log(f"⚠️ [TWS错误] {error_msg}", level="WARN")
+            else:
+                sys_log(f"⚠️ [TWS错误] {error_msg}", level="TWS-Err")
+        except Exception:
+            sys_log(f"⚠️ [TWS错误] {error_msg}", level="TWS-Err")
 
 
 def standardize_df(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:

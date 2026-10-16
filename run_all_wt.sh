@@ -29,7 +29,7 @@ first=1
 for pair in "${PAIRS[@]}"; do
   symbol="${pair%%:*}"
   clientid="${pair##*:}"
-  inner="cd $PROJECT_DIR && source .venv/bin/activate && python main.py --symbol $symbol --clientid $clientid; exec bash"
+  inner="cd $PROJECT_DIR && source .venv/bin/activate && python main.py --symbol $symbol --clientid $clientid --port 7497; exec bash"
 
   if [ $first -eq 1 ]; then
     args+=( new-tab --title "$symbol" wsl.exe -- bash -lic "$inner" )

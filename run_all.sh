@@ -41,7 +41,7 @@ first=1
 for pair in "${PAIRS[@]}"; do
   symbol="${pair%%:*}"
   clientid="${pair##*:}"
-  cmd="cd $PROJECT_DIR && source .venv/bin/activate && python main.py --symbol $symbol --clientid $clientid"
+  cmd="cd $PROJECT_DIR && source .venv/bin/activate && python main.py --symbol $symbol --clientid $clientid --port 7497"
 
   if [ $first -eq 1 ]; then
     tmux new-session -d -s "$SESSION" -n "$symbol"

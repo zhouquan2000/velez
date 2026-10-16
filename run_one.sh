@@ -13,4 +13,4 @@ CLIENTID="${2:-31}"
 cd ~/velez/velez
 source .venv/bin/activate
 echo "🚀 启动 $SYMBOL (clientId=$CLIENTID) ..."
-python main.py --symbol "$SYMBOL" --clientid "$CLIENTID"
+python main.py --symbol "$SYMBOL" --clientid "$CLIENTID" --port 7497

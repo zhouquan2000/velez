@@ -1,4 +1,4 @@
-﻿# ======================================================================
+# ======================================================================
 # trading_context.py - 精确导入清单
 # ======================================================================
 
@@ -514,27 +514,6 @@ class TradingContext:
 
         except Exception as e:
             self.sys_log(f"❌ {self.symbol} 启动自愈对账异常: {e}", level="ERROR")
-
-    def estimate_ibkr_commission(
-        self, qty: float, price: float, direction: str
-    ) -> float:
-        """[类方法] 估算 IBKR 阶梯佣金与监管费 (对齐 06-9)"""
-        qty = abs(qty)
-        # 1. 基础阶梯佣金 (Tiered)
-        base_comm = max(0.35, qty * 0.0035)
-
-        # 2. 监管费 (Regulator Fees)
-        sec_fee = 0.0
-        finra_fee = 0.0
-
-        if direction.upper() == "SELL":
-            # SEC 费率 (估算值)
-            sec_fee = (qty * price) * 0.0000229
-            # FINRA 费率 (0.000119/股，最高 5.95)
-            finra_fee = min(5.95, qty * 0.000119)
-
-        total_comm = base_comm + sec_fee + finra_fee
-        return round(total_comm, 2)
 
     def log_trade(
         self,

@@ -1,6 +1,6 @@
-# Velez — Oliver Velez 大象柱量化交易系统
+# Velez — Oliver Velez 8种策略的量化交易系统
 
-基于 [Oliver Velez](https://en.wikipedia.org/wiki/Oliver_Velez) 交易法则（"大象柱" Elephant Bar 形态 + 8 条交易法则中的 7 条）构建的美股日内量化交易程序，通过 IBKR（Interactive Brokers）的 TWS / IB Gateway API 自动执行交易。
+基于 [Oliver Velez](https://en.wikipedia.org/wiki/Oliver_Velez) 交易法则（8 条交易法则中的 7 条）构建的美股日内量化交易程序，通过 IBKR（Interactive Brokers）的 TWS / IB Gateway API 自动执行交易。
 
 > ⚠️ **免责声明**：本项目仅供**学习与研究**使用，不构成任何投资建议。代码内包含**真实下单逻辑**（市价单 / 止损单 / 追踪止损）。使用 Live 账户运行将**真实动用资金并产生盈亏**，风险自担。请务必先在 **Paper（模拟）账户**上充分测试，确认理解全部行为后再考虑实盘。
 
@@ -44,13 +44,13 @@
 
 每只股票有一组个性化"指纹"参数（`STOCK_CONFIGS`，见 `velez_bot/shared.py`）：
 
-| 参数 | 含义 |
-|---|---|
-| `eb_range_mult` | 实体长度相对 ATR 的倍数（爆发力门槛） |
-| `eb_vol_mult` | 成交量相对 20 根均量的倍数（资金确认） |
-| `eb_body_ratio` | 实体占整根 K 线的比例（纯度） |
-| `risk_unit` | 每笔交易的风险单元（美元） |
-| `max_qty` | 单只股票最大持仓股数 |
+| 参数              | 含义                                   |
+| ----------------- | -------------------------------------- |
+| `eb_range_mult` | 实体长度相对 ATR 的倍数（爆发力门槛）  |
+| `eb_vol_mult`   | 成交量相对 20 根均量的倍数（资金确认） |
+| `eb_body_ratio` | 实体占整根 K 线的比例（纯度）          |
+| `risk_unit`     | 每笔交易的风险单元（美元）             |
+| `max_qty`       | 单只股票最大持仓股数                   |
 
 信号由 **2 分钟 K 线**（历史数据）计算，交易循环由 **5 秒实时 bar**（`reqRealTimeBars`）驱动。
 
@@ -58,11 +58,11 @@
 
 默认内置 8 只美股（均为 NASDAQ 上市），按波动性分组：
 
-| 波动组 | 股票 | 特点 |
-|---|---|---|
-| 低波动 | AAPL、MSFT | 宽松门槛，捕捉稀缺信号 |
-| 中波动 | GOOG、AMZN、AMD | 标准门槛 |
-| 高波动 | META、NVDA、TSLA | 严格门槛，过滤噪音 |
+| 波动组 | 股票             | 特点                   |
+| ------ | ---------------- | ---------------------- |
+| 低波动 | AAPL、MSFT       | 宽松门槛，捕捉稀缺信号 |
+| 中波动 | GOOG、AMZN、AMD  | 标准门槛               |
+| 高波动 | META、NVDA、TSLA | 严格门槛，过滤噪音     |
 
 ## 环境要求
 
@@ -96,10 +96,10 @@ pip install -r requirements.txt
 
 程序通过 TCP 连接本机运行的 TWS / IB Gateway，端口是**区分 Paper / Live 的标识**：
 
-| 网关 | Live 端口 | Paper 端口 |
-|---|---|---|
-| IB Gateway | 4001 | 4002 |
-| TWS（GUI） | 7496 | 7497 |
+| 网关       | Live 端口 | Paper 端口 |
+| ---------- | --------- | ---------- |
+| IB Gateway | 4001      | 4002       |
+| TWS（GUI） | 7496      | 7497       |
 
 ### 方式一：IB Gateway（推荐）
 
@@ -161,18 +161,18 @@ python main.py --symbol AAPL --port 7496
 
 程序依赖两类数据，权限是**分开的两套**：
 
-| 数据类型 | 接口 | 是否需要付费订阅 |
-|---|---|---|
-| 历史数据（2 分钟 K 线、VIX 15 分钟线） | `reqHistoricalData` | 否，默认可用 |
-| 实时行情（5 秒 bar，驱动交易循环） | `reqRealTimeBars` | **是，需要 Level 1 订阅** |
+| 数据类型                               | 接口                  | 是否需要付费订阅                |
+| -------------------------------------- | --------------------- | ------------------------------- |
+| 历史数据（2 分钟 K 线、VIX 15 分钟线） | `reqHistoricalData` | 否，默认可用                    |
+| 实时行情（5 秒 bar，驱动交易循环）     | `reqRealTimeBars`   | **是，需要 Level 1 订阅** |
 
 实时行情（Level 1）订阅：登录 [Client Portal](https://ndcdyn.interactivebrokers.com) → `Settings → Market Data Subscriptions`，订阅美股三大实时行情（Non-Pro 价格）：
 
-| 订阅项 | 覆盖 | 价格 |
-|---|---|---|
-| NASDAQ (Network C/UTP) (NPL1) | NASDAQ 上市股票（本项目 8 只全在此） | $1.50/月 |
-| NYSE (Network A/CTA) (NPL1) | NYSE 上市股票 | $1.50/月 |
-| NYSE American, BATS, ARCA, IEX (Network B) (NPL1) | 区域交易所（SMART 路由可能走这些） | $1.50/月 |
+| 订阅项                                            | 覆盖                                 | 价格     |
+| ------------------------------------------------- | ------------------------------------ | -------- |
+| NASDAQ (Network C/UTP) (NPL1)                     | NASDAQ 上市股票（本项目 8 只全在此） | $1.50/月 |
+| NYSE (Network A/CTA) (NPL1)                       | NYSE 上市股票                        | $1.50/月 |
+| NYSE American, BATS, ARCA, IEX (Network B) (NPL1) | 区域交易所（SMART 路由可能走这些）   | $1.50/月 |
 
 - **最低要求**：至少订阅 NASDAQ Network C（本项目 8 只股票全为 NASDAQ）。
 - **推荐**：三档全订（共 $4.50/月），覆盖 SMART 智能路由可能成交的所有交易所。
@@ -196,10 +196,10 @@ python main.py --symbol AAPL      # 默认 clientId 31
 
 ### 8 只股票全量
 
-| 脚本 | 方式 | 说明 |
-|---|---|---|
-| `./run_all.sh` | tmux | 8 只股票各占一个 tmux 窗口（Linux / WSL 推荐） |
-| `./run_all_wt.sh` | Windows Terminal | 8 只股票各占一个 tab（Windows 推荐） |
+| 脚本                | 方式             | 说明                                           |
+| ------------------- | ---------------- | ---------------------------------------------- |
+| `./run_all.sh`    | tmux             | 8 只股票各占一个 tmux 窗口（Linux / WSL 推荐） |
+| `./run_all_wt.sh` | Windows Terminal | 8 只股票各占一个 tab（Windows 推荐）           |
 
 内置 8 只股票的 clientId 映射（31–38）：
 
@@ -217,24 +217,24 @@ AAPL:31  AMD:32  AMZN:33  GOOG:34  META:35  MSFT:36  NVDA:37  TSLA:38
 
 启动前请逐项确认：
 
-| 检查项 | 如何确认 |
-|---|---|
-| tmux 已安装（`run_all.sh` 依赖） | `tmux -V`；未装则 `sudo apt install tmux` |
-| TWS / IB Gateway 已登录 | 网关窗口 Connection Status 显示 `connected`，且能读到账户数据 |
-| 美股交易时段内 | 美东 9:30–16:00（收盘后启动会立即退出，属正常行为） |
-| live 账号未在别处登录 | 手机 app / Client Portal 网页都登出，避免 Error 162 |
+| 检查项                             | 如何确认                                                        |
+| ---------------------------------- | --------------------------------------------------------------- |
+| tmux 已安装（`run_all.sh` 依赖） | `tmux -V`；未装则 `sudo apt install tmux`                   |
+| TWS / IB Gateway 已登录            | 网关窗口 Connection Status 显示 `connected`，且能读到账户数据 |
+| 美股交易时段内                     | 美东 9:30–16:00（收盘后启动会立即退出，属正常行为）            |
+| live 账号未在别处登录              | 手机 app / Client Portal 网页都登出，避免 Error 162             |
 
 ### tmux 操作（run_all.sh）
 
 `run_all.sh` 启动后会自动 `tmux attach` 进入总控台，底部显示 8 个窗口（AAPL / AMD / ... / TSLA）：
 
-| 操作 | 作用 |
-|---|---|
-| `Ctrl+b` 然后 `d` | 脱离（detach），程序继续后台运行 |
-| `Ctrl+b` + `0`–`7` | 跳到第 N 个窗口（对应 8 只股票） |
-| `Ctrl+b` + `n` / `p` | 下一个 / 上一个窗口 |
-| `tmux attach -t velez` | 重新进入会话 |
-| `tmux kill-session -t velez` | 全部关停 |
+| 操作                           | 作用                             |
+| ------------------------------ | -------------------------------- |
+| `Ctrl+b` 然后 `d`          | 脱离（detach），程序继续后台运行 |
+| `Ctrl+b` + `0`–`7`      | 跳到第 N 个窗口（对应 8 只股票） |
+| `Ctrl+b` + `n` / `p`     | 下一个 / 上一个窗口              |
+| `tmux attach -t velez`       | 重新进入会话                     |
+| `tmux kill-session -t velez` | 全部关停                         |
 
 ### 推荐启动流程
 
@@ -245,12 +245,12 @@ AAPL:31  AMD:32  AMZN:33  GOOG:34  META:35  MSFT:36  NVDA:37  TSLA:38
 
 ## 命令行参数
 
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--symbol` | `AAPL` | 股票代码（须在 `STOCK_CONFIGS` 中定义） |
-| `--clientid` | `31` | IBKR 客户端 ID（多实例时须唯一） |
-| `--host` | `127.0.0.1` | TWS / IB Gateway 主机地址 |
-| `--port` | `4002` | 网关端口（Paper Gateway=4002，TWS Paper=7497，Live Gateway=4001，TWS Live=7496） |
+| 参数           | 默认值        | 说明                                                                             |
+| -------------- | ------------- | -------------------------------------------------------------------------------- |
+| `--symbol`   | `AAPL`      | 股票代码（须在 `STOCK_CONFIGS` 中定义）                                        |
+| `--clientid` | `31`        | IBKR 客户端 ID（多实例时须唯一）                                                 |
+| `--host`     | `127.0.0.1` | TWS / IB Gateway 主机地址                                                        |
+| `--port`     | `4002`      | 网关端口（Paper Gateway=4002，TWS Paper=7497，Live Gateway=4001，TWS Live=7496） |
 
 ## 目录结构
 
@@ -274,13 +274,46 @@ velez/
 
 ## 日志
 
-程序运行日志落盘在 `log_file/` 目录，包括：
+程序运行日志全部落盘在 `log_file/` 目录，日志时间戳一律采用**美东时间（America/New_York）**。
 
-- 系统级日志（资金报告、VIX、收盘清仓）
-- 个股级日志（信号、下单、持仓治理、追踪止损）
-- `VIX-15m-<日期>.csv`、个股 2 分钟原始 K 线 CSV
+**每只股票每个交易日生成 6 个文件**（3 个日志 + 3 个行情 CSV）：
 
-日志时间戳采用**美东时间（America/New_York）**。
+| 文件 | 命名格式 | 内容 | 主要用途 |
+| ---- | -------- | ---- | -------- |
+| 系统日志 | `{日期}_{股票}_Sys_log.txt` | 该股全天运行事件（初始化、行情合成、信号识别、下单、止损止盈、对账、熔断） | 调试、复盘、排查问题 |
+| 成交日志 | `{日期}_{股票}_Trade_log.csv` | 每笔成交明细（开仓/平仓、价格、净盈亏、佣金、累计盈亏） | 盈亏统计、每日复盘 |
+| 状态审计日志 | `{日期}_{股票}_cond_log.txt` | 状态机每一拍的对账诊断（状态代码、持仓、状态） | 审计治理流转、排查持仓不同步 |
+| 5 秒 bar | `{股票}-5s-{日期}.csv` | 5 秒实时 bar 的 OHLCV（`reqRealTimeBars` 原始数据） | 最细粒度行情存档 |
+| 2 分钟 K 线 | `{股票}-2m-{日期}.csv` | 2 分钟 K 线 OHLCV（策略主信号周期） | 信号复盘 |
+| 15 分钟 K 线 | `{股票}-15m-{日期}.csv` | 15 分钟 K 线 OHLCV（趋势判断周期） | 趋势复盘 |
+
+> 命名中 `{日期}` 为 `YYYY-MM-DD`（如 `2026-10-16`），`{股票}` 为大写代码（如 `AAPL`）。示例：`2026-10-16_AAPL_Sys_log.txt`、`AAPL-2m-2026-10-16.csv`。
+
+### 各文件格式
+
+**系统日志 `Sys_log.txt`**：每行一条事件，格式 `[HH:MM:SS.mmm] [股票] 图标 消息`：
+
+```
+[10:18:05] [AAPL] 💡 ✅ [V180L] 开仓单和止损单已提交
+[10:21:43] [AAPL] ⚠️ 📉 [风险控制]本次交易亏损-68.71...连续亏损: 1次
+```
+
+**成交日志 `Trade_log.csv`**：表头 `time,symbol,action,qty,price,net_pnl,commission,cum_pnl,loss_streak,exec_id,label`。每行一笔成交：开仓单 `net_pnl=0`，平仓单 `net_pnl` 为该笔净盈亏（已扣佣金），`cum_pnl` 为当日累计盈亏。日终盈亏分析直接对 `net_pnl` 求和即可。
+
+**状态审计日志 `cond_log.txt`**：每行格式 `[HH:MM:SS.mmm] | Cond: 代码 | Msg: 说明 | Pos: 持仓 | State: 状态`，记录状态机每一拍的结果（如 `cond_01` 标准待机、`cond_08_07` 开仓完美、`cond_12_05` 标准稳态、`cond_09` 结账归零、`cond_11_01` 裸奔补防）。
+
+**行情 CSV（5s / 2m / 15m）**：三者表头一致 `datetime,open,high,low,close,volume`。区别：5 秒 CSV 的 `datetime` 只有时分秒（如 `12:30:20`，实时 bar 无日期）；2 分钟 / 15 分钟 CSV 的 `datetime` 为完整日期时间（如 `2026-10-16 09:30:00`），且启动时会先写入回溯数日的历史 K 线、再追加当日实时数据。
+
+### 全局共享文件（非按股票）
+
+| 文件 | 内容 |
+| ---- | ---- |
+| `Global_System_YYYYMMDD.log` | 全局系统日志（账户资金报告、VIX 调度、连接状态等跨品种信息） |
+| `VIX-15m-YYYY-MM-DD.csv` | VIX 恐慌指数 15 分钟 K 线（风控环境自适应用） |
+| `ib_insync_debug.log` | ib_insync 库底层日志（Error 162、request timeout 等） |
+| `{日期}_交易盈亏分析报告.md` | 日终盈亏分析报告（复盘工具生成，非程序自动产出） |
+
+> 注：`log_file/` 目录已被 `.gitignore` 忽略，日志不会进入版本库。若某天某股无任何成交，则当天不会生成对应的 `Trade_log.csv`。
 
 ## 风险提示
 
@@ -335,4 +368,6 @@ velez/
 
 ## License
 
-（待定 —— 发布前请选择并添加 LICENSE 文件）
+本项目采用 [MIT License](LICENSE) 开源。
+
+    Copyright (c) 2026 周全 (zhouquan)

@@ -6,6 +6,47 @@
 
 ---
 
+## English Overview
+
+**Velez** is an automated intraday trading framework for US equities built around
+[Oliver Velez](https://en.wikipedia.org/wiki/Oliver_Velez)'s price-action laws (7 of the 8),
+executed through the Interactive Brokers TWS / IB Gateway API via `ib_insync`.
+
+**Status: research & engineering reference — not a profitable strategy.**
+A 15-month backtest (7,485 unique round-trips after de-duplication) shows a **negative
+expectancy of −1.84 per trade (t = −2.36)**, with commissions accounting for 56.7% of the loss.
+Over the same period, an equal-weight buy-and-hold of the same eight symbols returned **+24.7%**.
+The repository is published for its engineering value: bracket-order management, a position
+state machine, per-day risk persistence, disconnect recovery, order-level reconciliation and
+reporting.
+
+**Repository map**
+
+| Path | Purpose |
+| --- | --- |
+| `main.py` | Entry point: `python main.py --symbol AAPL --clientid 31` |
+| `velez_bot/` | The trading bot: signals, order management, trailing stops, risk, reconciliation |
+| `log_file/` | Generated at runtime (git-ignored): per-symbol logs, trade CSVs, risk state |
+| `run_one.sh` / `run_all.sh` / `run_all_wt.sh` | Launchers: single symbol / 8 symbols in tmux / in Windows Terminal |
+
+**Requirements**: Python 3.12, an IBKR account (Paper recommended), and TWS or IB Gateway with
+the API enabled on `127.0.0.1` — port `7497` (TWS paper), `7496` (TWS live), `4002` / `4001`
+(IB Gateway paper / live).
+
+**Quick start**
+
+```bash
+git clone https://github.com/zhouquan2000/velez.git && cd velez
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python main.py --help
+```
+
+**Disclaimer**: educational and research use only. The code places real orders — always start
+with a paper account. Nothing here is investment advice.
+
+---
+
 ## 项目现状（务必先读）
 
 **这套 8 法则系统在 15 个月回测中没有统计意义上的正期望，作者已停止在该策略上继续投入。**
@@ -32,6 +73,7 @@ IBKR 自动交易工程实现（订单 / 止损 / 风控 / 对账 / 监控 / 报
 
 ## 目录
 
+- [English Overview](#english-overview)
 - [项目现状（务必先读）](#项目现状务必先读)
 - [功能特性](#功能特性)
 - [目录与文件说明](#目录与文件说明)

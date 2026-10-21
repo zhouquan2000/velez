@@ -105,9 +105,52 @@ parser = argparse.ArgumentParser(description="Velez量化交易系统 - 参数�
 parser.add_argument("--symbol", type=str, default="AAPL", help="股票代码 (默认: AAPL)")
 parser.add_argument("--clientid", type=int, default=31, help="客户端ID (默认: 31)")
 parser.add_argument("--host", type=str, default="127.0.0.1", help="TWS/IB Gateway 主机地址 (默认: 127.0.0.1)")
-parser.add_argument("--port", type=int, default=4002, help="TWS/IB Gateway 端口 (Paper Gateway=4002, TWS Paper=7497)")
+parser.add_argument("--port", type=str, default="auto",
+                    help="TWS/IB Gateway 端口；auto=自动探测 (优先 TWS Paper 7497 → Gateway Paper 4002 → TWS Live 7496 → Gateway Live 4001)")
 # parser.add_argument('--client_id', type=int, required=True, help='TWS 客户端 ID，如 31')
 args = parser.parse_args()
+
+
+# ----------------------------------------------------------------------
+# 🔌 API 端点自动适配：TWS(Linux/Windows) 与 IB Gateway 端口不同，逐一探测
+# ----------------------------------------------------------------------
+API_PORT_CANDIDATES = [
+    (7497, "TWS 纸面 Paper"),
+    (4002, "IB Gateway 纸面 Paper"),
+    (7496, "TWS 实盘 Live"),
+    (4001, "IB Gateway 实盘 Live"),
+]
+
+
+def _port_open(host: str, port: int, timeout: float = 0.6) -> bool:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        try:
+            s.connect((host, port))
+            return True
+        except OSError:
+            return False
+
+
+def resolve_api_port(host: str, requested) -> tuple[int, str]:
+    """返回 (端口, 人类可读标签)。requested 为 'auto' 时按优先级探测。"""
+    if str(requested).strip().lower() not in ("auto", "", "none"):
+        p = int(requested)
+        label = dict(API_PORT_CANDIDATES).get(p, "自定义端口")
+        return p, label
+
+    alive = [(p, lab) for p, lab in API_PORT_CANDIDATES if _port_open(host, p)]
+    if not alive:
+        return 7497, "TWS 纸面 Paper（未检测到任何监听，按默认端口尝试）"
+    if len(alive) > 1:
+        print(f"⚠️ 检测到多个 API 端口在监听: {[p for p, _ in alive]} → 使用 {alive[0][0]}")
+    return alive[0]
+
+
+api_port, api_port_label = resolve_api_port(args.host, args.port)
+print(f"🔌 API 端点: {args.host}:{api_port} ({api_port_label})")
 
 # 将参数赋值给变量
 symbol = args.symbol.upper()  # 统一转为大写
@@ -230,8 +273,8 @@ if cl_id is None:
 # eb_vol_mult:   成交量相对于过去 20 根均量的倍数 (资金确认)
 # eb_body_ratio: 实体占整根 K 线长度的最小比例 (纯度)
 try:
-    ib.connect(args.host, args.port, clientId=cl_id)
-    print(f"✅ 连接成功 | 股票代码: {args.symbol} | ClientID: {cl_id} | {args.host}:{args.port}")
+    ib.connect(args.host, api_port, clientId=cl_id)
+    print(f"✅ 连接成功 | 股票代码: {args.symbol} | ClientID: {cl_id} | {args.host}:{api_port} ({api_port_label})")
 except Exception as e:
     print(f"❌ 连接TWS失败: {e}")
     os._exit(0)
@@ -647,9 +690,11 @@ async def load_vix_data_async(is_init=False):
 # ======================================================================
 _reconnect_task = None
 _reconnect_hook = None  # 重连成功后的重新订阅回调（由 app.py 注入，避免 shared→events 循环 import）
-MAX_RECONNECT_ATTEMPTS = 10
-RECONNECT_BACKOFF_INIT = 2.0  # 初始退避秒数
-RECONNECT_BACKOFF_MAX = 60.0  # 最大退避秒数
+MAX_RECONNECT_ATTEMPTS = 10      # 旧策略（10 次指数退避）保留常量仅为兼容，已不再使用
+RECONNECT_BACKOFF_INIT = 2.0     # 旧策略用；保留以免外部引用报错
+RECONNECT_BACKOFF_MAX = 60.0     # 旧策略用；保留
+RECONNECT_INTERVAL = 300.0       # 新策略：每 5 分钟重试一次
+MARKET_CLOSE_HOUR_ET = 16        # 重连窗口截止：当日 16:00 ET 收盘
 
 
 def set_reconnect_hook(fn):
@@ -731,18 +776,44 @@ async def sync_all_positions(tag="链路自愈"):
             ctx.log(f"❌ [{tag}] 品种 {symbol} 对账异常: {e}", level="ERROR")
 
 
+def _et_now():
+    """当前美东时间（trading_context/app 全项目统一用 EASTERN_TZ）。"""
+    return datetime.now(EASTERN_TZ)
+
+
+def _seconds_to_close():
+    """距当日 16:00 ET 收盘还剩多少秒；已过收盘返回 <= 0。"""
+    now = _et_now()
+    close = now.replace(hour=MARKET_CLOSE_HOUR_ET, minute=0, second=0, microsecond=0)
+    return (close - now).total_seconds()
+
+
 async def reconnect_loop():
-    """重连循环：指数退避重试，成功后重新订阅 + 同步持仓，失败告警退出。"""
+    """重连循环：每 5 分钟重试一次，直到当日 16:00 ET 收盘。
+
+    2026-10-20 改：旧版 10 次指数退避（约 5 分 42 秒）后就 os._exit(1)，
+    TWS 每晚 Auto Logoff / 人工重启只要超过这个窗口，8 个品种就集体自杀、
+    当天无法自行恢复（10-20 凌晨 02:45 就是这么死的）。新版改为每 5 分钟一次、
+    持续到收盘，TWS 回来即自动接上（重连成功仍走"对账 + 重新订阅"原路径）。
+    """
     global _reconnect_hook
-    backoff = RECONNECT_BACKOFF_INIT
-    for attempt in range(1, MAX_RECONNECT_ATTEMPTS + 1):
+    attempt = 0
+    while True:
+        remaining = _seconds_to_close()
+        if remaining <= 0:
+            sys_log(
+                "⏹️ [自动重连] 已到收盘时间(16:00 ET)，停止重连并退出。",
+                level="CRITICAL",
+            )
+            os._exit(1)
+        attempt += 1
         try:
             sys_log(
-                f"🔄 [自动重连] 第 {attempt}/{MAX_RECONNECT_ATTEMPTS} 次尝试连接 "
-                f"{args.host}:{args.port} (clientId={cl_id}) ...",
+                f"🔄 [自动重连] 第 {attempt} 次尝试连接 "
+                f"{args.host}:{api_port} (clientId={cl_id}) ...",
                 level="System",
             )
-            await ib.connectAsync(args.host, args.port, clientId=cl_id, timeout=4)
+            await ib.connectAsync(args.host, api_port, clientId=cl_id, timeout=4)
             sys_log("✅ [自动重连] 连接成功，开始同步持仓...", level="System")
             # 1. 同步持仓（公共函数，带节流去重，与 1102 分支共享）
             await sync_all_positions("重连对账")
@@ -752,12 +823,15 @@ async def reconnect_loop():
             sys_log("✅ [自动重连] 全部完成，恢复正常运行。", level="System")
             return
         except Exception as e:
-            sys_log(f"⚠️ [自动重连] 第 {attempt} 次失败: {e}", level="WARN")
-            if attempt < MAX_RECONNECT_ATTEMPTS:
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX)
-    sys_log("🚨 [自动重连失败] 超过最大重试次数，程序退出以避免静默空转。", level="CRITICAL")
-    os._exit(1)
+            # 距收盘不足一个周期时，把最后一次尝试压在收盘前 30 秒，
+            # 保证收盘清仓那一步仍有连接可用。
+            wait = min(RECONNECT_INTERVAL, max(1.0, remaining - 30.0))
+            sys_log(
+                f"⚠️ [自动重连] 第 {attempt} 次失败: {e} | "
+                f"{int(wait)}s 后重试（距 16:00 ET 收盘 {int(remaining)}s）",
+                level="WARN",
+            )
+            await asyncio.sleep(wait)
 
 
 def on_tws_error(reqId, errorCode, errorString, contract):
@@ -778,14 +852,24 @@ def on_tws_error(reqId, errorCode, errorString, contract):
 
     # 3. 核心分发逻辑
 
-    # --- A类：物理断连 (2105, 1100) ---
-    if errorCode in {1100, 2103, 2105}:
+    # --- A类：真正的物理断连（仅 1100）---
+    # 2103/2105 是"行情农场"状态消息（usfarm/usopt/ushmds），农场抖动不代表 TWS↔IBKR 交易链路断开。
+    # 之前把它们一并当作断连，会触发无谓的重连；而每次重连 ib_insync 都会重放账户当日全部成交，
+    # 导致佣金报告成片刷屏（2026-10-19 实测：一次 usopt 农场抖动引发上百条佣金回调）。
+    if errorCode == 1100:
         sys_log(
             f"🚨 [TWS警报] 与IBKR服务器的物理链路中断！程序进入静默等待：{error_msg}",
             level="TWS-Alert",
         )
         # winsound.Beep(1000, 1000)  # 🔇 Windows专用声音函数，Linux下注释停用
         on_disconnected()  # 🔥 触发自动重连
+
+    # --- A2类：行情农场状态（2103 农场断开 / 2105 HMDS 断开）---
+    # 只记录，不重连：农场会自己恢复，重连无助于修复，反而引发成交回放。
+    elif errorCode in {2103, 2105}:
+        sys_log(
+            f"⚠️ [行情农场] {error_msg}（农场级状态，不触发重连）", level="TWS-Alert"
+        )
 
     # --- B类：复连自愈 (2104, 1102) ---
     elif errorCode in {2104, 1102}:

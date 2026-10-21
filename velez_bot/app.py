@@ -31,6 +31,22 @@ from .events import on_exec_details, on_bar_update
 from .shared import on_tws_error, on_disconnected, set_reconnect_hook, setup_ib_insync_logging
 
 
+def on_commission_report(trade, fill, commission_report):
+    """模块级单一分发器：按合约代码把佣金报告投给对应品种的 context。
+
+    以前是让每个 ctx 各绑定一次全局事件（8 个实例），同一条报告会被处理 8 遍，
+    产生 8 倍日志、8 份 pending_commission。改为单绑 + 按 symbol 分发。
+    """
+    try:
+        symbol = trade.contract.symbol if trade and trade.contract else None
+    except Exception:
+        symbol = None
+    ctx = contexts_placeholder.get(symbol) if symbol else None
+    if ctx is None:
+        return
+    ctx.on_commission_report(trade, fill, commission_report)
+
+
 def resubscribe_streams():
     """重新订阅 5s 实时数据（断连重连后调用）。"""
     for symbol, ctx in contexts_placeholder.items():
@@ -82,10 +98,10 @@ async def main():
     # 1. execDetailsEvent - 模块级函数绑定（一个绑定处理所有 symbol）
     ib.execDetailsEvent += on_exec_details
 
-    # 2. commissionReportEvent - 为每个 ctx 实例绑定（需要逐个绑定）
-    for symbol, ctx in contexts_placeholder.items():
-        ib.commissionReportEvent += ctx.on_commission_report
-        ctx.log(f"📡 佣金报告回调已绑定")
+    # 2. commissionReportEvent - 模块级单绑，按 symbol 分发
+    #    （旧写法是每个 ctx 各绑一次 → 同一条报告被 8 个实例各处理一遍）
+    ib.commissionReportEvent += on_commission_report
+    sys_log("📡 佣金报告回调已绑定（模块级单绑，按品种分发）")
 
     # 3. errorEvent - 全局错误监听器
     ib.errorEvent += on_tws_error

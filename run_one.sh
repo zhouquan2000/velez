@@ -9,8 +9,10 @@ set -e
 
 SYMBOL="${1:-AAPL}"
 CLIENTID="${2:-31}"
+# 第 3 个参数可选：端口。不传 = auto（自动识别 TWS Windows/Linux 与 IB Gateway）
+PORT_ARG="${3:-auto}"
 
 cd ~/velez/velez
 source .venv/bin/activate
-echo "🚀 启动 $SYMBOL (clientId=$CLIENTID) ..."
-python main.py --symbol "$SYMBOL" --clientid "$CLIENTID" --port 7497
+echo "🚀 启动 $SYMBOL (clientId=$CLIENTID, port=$PORT_ARG) ..."
+python main.py --symbol "$SYMBOL" --clientid "$CLIENTID" --port "$PORT_ARG"

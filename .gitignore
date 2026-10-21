@@ -1,14 +1,41 @@
+# --- Python ---
 __pycache__/
-velez_bot/__pycache__/
+*.pyc
+.pytest_cache/
+
+# --- 虚拟环境 ---
+venv/
+env/
+.venv/
+.venv.broken_py314/
+.venv.broken_py314.off/
+.venv.*/
+
+# --- 凭证与运行数据 ---
+.env
 log_file/
+*.log
+
+# --- 报表产物（默认输出到仓库外，防止误提交）---
+*.docx
+*.xlsx
+
+# --- 旧脚本 / 本机特定 ---
 backtest/backtest_old_version.py
 monitor.bat
 startall.bat
-venv/
-env/
-*.pyc
-.pytest_cache/
-.venv/
-.venv.broken_py314/
-.env
-__pycache__/
+
+# --- 系统 ---
+.DS_Store
+Thumbs.db
+
+# --- 本地专用，不公开（与交易程序本身无关的工具/脚本）---
+.agents/
+.claude/
+.codex/
+tools/
+pnl_watch.sh
+pnl_report.sh
+pnl_stats.sh
+check_velez.sh
+requirements-dev.txt

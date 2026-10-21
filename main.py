@@ -4,7 +4,7 @@
 #  __init__.py; app.py; context_snapshot.py; events.py; shared.py; trading_context.py
 #  提交运行程序的方式： 在vsc的 terminal里面， 先运行
 #  & C:/Data/IB_Robot/venv/Scripts/Activate.ps1 激活虚拟环境
-# 然后再运行： (venv) PS C:\Data\IB_Robot\TWS_IB_Project\velez> python main.py --symbol AAPL --clinedid 31
+# 然后再运行（在仓库根目录）：
 # 其中 --symbol 空格后面是股票代码， --clientid 空格后面是 连接IBKR服务器的cliendID的序号
 # Test-Paper-08-12.py   2026-01-15 开始重构---2026-02-20 最后update
 # 对原来的 Test-Paper-AAPL-OliverLaw_06-9.py 进行重大升级改造---重构程序

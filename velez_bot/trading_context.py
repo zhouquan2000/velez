@@ -4,6 +4,7 @@
 
 # --- 1. 标准库 ---
 import os
+import json
 import time as time_module
 import traceback
 import asyncio
@@ -329,6 +330,68 @@ class TradingContext:
         )
         self.sys_log(f"✅{symbol}的变量初始化工作完成", level="INFO")
 
+        # --- 7. [风控状态持久化] 重启后恢复当日连损计数 / 累计PnL / 熔断标记 ---
+        # 以前这些只在进程内存里，重启即清零 —— 连损记录和当日亏损都会被"重启"洗掉。
+        self._load_risk_state()
+
+    # ==================================================================
+    # 风控状态持久化（连损计数 / 当日累计PnL / 熔断标记）
+    # ==================================================================
+    def _risk_state_path(self):
+        today_str = datetime.now(EASTERN_TZ).strftime("%Y-%m-%d")
+        return os.path.join(
+            ensure_log_dir(), f"risk_state_{today_str}_{self.symbol}.json"
+        )
+
+    def _load_risk_state(self):
+        """启动时读回当日风控状态；文件不存在 = 新的一天，从零开始。"""
+        path = self._risk_state_path()
+        try:
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.consecutive_losses = int(data.get("consecutive_losses", 0) or 0)
+            self.pnl_total = float(data.get("pnl_total", 0.0) or 0.0)
+            suspended = bool(data.get("suspended", False))
+            if suspended:
+                self.suspend_today = True
+            self.sys_log(
+                f"♻️ [风控状态恢复] 连损={self.consecutive_losses}次 | "
+                f"当日累计PnL={self.pnl_total:.2f} | 熔断={'是' if suspended else '否'} "
+                f"(来源 {os.path.basename(path)})",
+                level="INFO",
+            )
+            if suspended:
+                self.sys_log(
+                    f"🚨 [风控状态恢复] 今日已触发熔断，本进程不交易；"
+                    f"如确需重置请删除 {path}",
+                    level="ERROR",
+                )
+        except Exception as e:
+            self.sys_log(f"⚠️ [风控状态恢复失败] {e}", level="WARN")
+
+    def _save_risk_state(self, suspended=None):
+        """写入当日风控状态（临时文件 + os.replace 原子替换，避免半截 JSON）。"""
+        if suspended is None:
+            suspended = bool(getattr(self, "suspend_today", False))
+        path = self._risk_state_path()
+        data = {
+            "symbol": self.symbol,
+            "date": datetime.now(EASTERN_TZ).strftime("%Y-%m-%d"),
+            "consecutive_losses": int(getattr(self, "consecutive_losses", 0)),
+            "pnl_total": round(float(getattr(self, "pnl_total", 0.0)), 4),
+            "suspended": bool(suspended),
+            "updated_at": datetime.now(EASTERN_TZ).isoformat(timespec="seconds"),
+        }
+        try:
+            tmp = f"{path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except Exception as e:
+            self.sys_log(f"⚠️ [风控状态写入失败] {e}", level="WARN")
+
     def sys_log(self, message, level="INFO"):
         """
         [07-12 品种级桥接]
@@ -640,6 +703,10 @@ class TradingContext:
                     f"🚨 [个股熔断] {self.symbol} 触发停止交易。原因: {reason}",
                     level="ERROR",
                 )
+
+            # --- 4.4 [风控状态落盘] 连损计数 / 当日累计PnL / 熔断标记写回文件，
+            #     让下一次重启能读回（否则每次重启都把风控记忆清零）---
+            self._save_risk_state()
 
             # --- 5. 构造标准审计记录 ---
             record = {
@@ -1217,10 +1284,16 @@ class TradingContext:
     async def async_patch_ticket(self, st_time, ed_time):
         """[类方法] 异步补票并触发审计与对账"""
         try:
+            # ✅ 补票请求必须带显式时区：旧写法 "YYYYMMDD HH:MM:SS" 被 TWS 当作隐含时区，
+            # 触发 2174 警告并让 HMDS 返回空（162），补票永远失败。这里显式标注 US/Eastern。
+            end_time_str = (
+                ed_time.astimezone(EASTERN_TZ) if ed_time.tzinfo is not None else ed_time
+            ).strftime("%Y%m%d %H:%M:%S") + " US/Eastern"
+
             # 1. 物理买票 (注意 ctx 变 self)
             patch_bars = await self.ib.reqHistoricalDataAsync(
                 self.contract,
-                endDateTime=ed_time.strftime("%Y%m%d %H:%M:%S"),
+                endDateTime=end_time_str,
                 durationStr="600 S",
                 barSizeSetting="2 mins",
                 whatToShow="TRADES",
@@ -1406,6 +1479,9 @@ class TradingContext:
             self.ma8 = ma8_series.iloc[-1]
             self.ma20_prev = ma20_series.iloc[-2]
             self.ma20_prev2 = ma20_series.iloc[-3]
+
+            # ✅ 缓存 MA20 序列，供 _check_ma20_slope 使用 (Law2/Law3 趋势斜率门)
+            self.ma20_series_cache = ma20_series
 
             # --- 3. MA200 与超级趋势判定 (SuperTrend) ---
             if data_len >= 200:
@@ -6987,6 +7063,22 @@ class TradingContext:
         commission = commission_report.commission
         realized_pnl = commission_report.realizedPNL
 
+        # ✅ BUG#3/4 修复：只处理本实例自己的成交。
+        # ib_insync 在每次 connectAsync 结束时会自动 reqExecutions()（ib.py:1782），
+        # TWS 会重放账户当日全部成交（含其它 clientId 的、手工在 TWS 下的单），
+        # 那些记录与本实例无关，直接静默丢弃，既不写日志也不进暂存队列。
+        own_client = getattr(shared, "cl_id", None)
+        exec_client = getattr(getattr(trade, "order", None), "clientId", None)
+        # 已经有 execDetails 映射过来的成交（exec_id_map）说明确实属于本实例，
+        # 即使 clientId 缺失/异常也放行，避免误伤本实例的结算。
+        if (
+            exec_id not in getattr(self, "exec_id_map", {})
+            and own_client is not None
+            and exec_client is not None
+            and exec_client != own_client
+        ):
+            return
+
         if not hasattr(self, "settlement_ledger"):
             self.settlement_ledger = {}
         if not hasattr(self, "exec_id_map"):
@@ -6994,19 +7086,25 @@ class TradingContext:
         if not hasattr(self, "pending_commission"):
             self.pending_commission = {}
 
+        oid = self.exec_id_map.get(exec_id)
+        matched = bool(oid) and oid in self.settlement_ledger
+
+        # ✅ BUG#5：匹配到订单的才用 INFO；未匹配的降级 DEBUG，避免历史回放淹没真正的告警
         self.sys_log(
             f"📊 [佣金报告回调] ExecId:{exec_id[:30]}... | "
             f"佣金:{commission:.2f} | PnL:{realized_pnl:.2f}",
-            level="INFO",
+            level="INFO" if matched else "DEBUG",
         )
 
-        oid = self.exec_id_map.get(exec_id)
-        if not oid or oid not in self.settlement_ledger:
+        if not matched:
+            now_ts = time_module.time()
             self.pending_commission[exec_id] = {
                 "commission": commission,
                 "realized_pnl": realized_pnl,
                 "report": commission_report,  # 或只存需要的字段
+                "ts": now_ts,
             }
+            self._prune_pending_commission(now_ts)
             self.sys_log(
                 f"⏳ [佣金报告暂存] ExecId:{exec_id[:30]}... 订单尚未创建，暂存待处理",
                 level="DEBUG",
@@ -7016,6 +7114,26 @@ class TradingContext:
         state = self.settlement_ledger[oid]
         self._apply_commission_to_state(state, exec_id, commission, realized_pnl)
         asyncio.create_task(self._try_settle_order(oid))
+
+    def _prune_pending_commission(self, now_ts, ttl_seconds=1800, max_entries=500):
+        """清理未匹配的佣金暂存，避免长期驻留。
+
+        BUG#4：每次重连 ib_insync 都会重放当日全部成交，暂存字典只增不减；
+        这里按 TTL(默认 30 分钟) 与容量上限(默认 500 条) 双保险回收。
+        """
+        pending = getattr(self, "pending_commission", None)
+        if not pending:
+            return
+        expired = [
+            k
+            for k, v in pending.items()
+            if now_ts - float(v.get("ts", now_ts)) > ttl_seconds
+        ]
+        for k in expired:
+            pending.pop(k, None)
+        if len(pending) > max_entries:
+            for k in list(pending.keys())[:-max_entries]:
+                pending.pop(k, None)
 
     def _apply_commission_to_state(self, state, exec_id, commission, realized_pnl):
         """将佣金数据应用到订单结算状态，处理去重和状态标记"""

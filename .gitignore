@@ -7,8 +7,6 @@ __pycache__/
 venv/
 env/
 .venv/
-.venv.broken_py314/
-.venv.broken_py314.off/
 .venv.*/
 
 # --- 凭证与运行数据 ---
